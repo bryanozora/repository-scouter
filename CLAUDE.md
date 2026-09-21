@@ -12,7 +12,9 @@ See [PLAN.md](PLAN.md) for the full project plan, architecture, and milestone li
 
 - Backend: Python + FastAPI.
 - Frontend: Next.js.
-- Follow the stack choices in PLAN.md (Anthropic SDK for the agent loop, SSE for streaming, SQLite for storage) unless the user directs otherwise.
+- Follow the stack choices in PLAN.md (an LLM provider abstraction — default: Ollama via its OpenAI-compatible endpoint — for the agent loop, SSE for streaming, SQLite for storage) unless the user directs otherwise.
+- The LLM is accessed through a provider abstraction, not a hardcoded SDK. Default provider is Ollama (`LLM_PROVIDER=ollama`, `LLM_MODEL=qwen2.5:7b-instruct`, optional comparison candidate `qwen3:8b`) served at `OLLAMA_BASE_URL` (default `http://localhost:11434/v1`). Keep prompts and tool schemas simple to accommodate weaker tool-calling reliability, and be mindful of the 8GB RAM constraint when suggesting model sizes.
+- Agent code must not depend on a specific LLM vendor or SDK. Call the LLM only through the provider abstraction so the provider/model can be swapped via `.env` without touching the agent loop.
 
 ## Agent Tools
 
@@ -21,7 +23,7 @@ See [PLAN.md](PLAN.md) for the full project plan, architecture, and milestone li
 
 ## Secrets
 
-- Never commit secrets, API keys, or tokens (Anthropic API key, GitHub token, etc.). Use `.env` / `.env.example` conventions — real values stay out of git.
+- Never commit secrets, API keys, or tokens (GitHub token, any hosted LLM provider key, etc.). Use `.env` / `.env.example` conventions — real values stay out of git.
 
 ## Testing
 
@@ -40,4 +42,5 @@ See [PLAN.md](PLAN.md) for the full project plan, architecture, and milestone li
 - Never run `git commit`, `git push`, or any other command that creates commits or publishes changes unless explicitly asked for in that message. Finishing a milestone or a task is not permission to commit.
 - When a commit is requested, make it small and focused with a clear message (one feature per commit), and show the message before committing.
 - Never push to a remote unless explicitly told to.
+- Do not add `Co-Authored-By` trailers or any other AI attribution lines to commit messages or PR descriptions. Commits carry only the user's authorship.
 - Make sure `.gitignore` covers `.env`, `node_modules`, `__pycache__`, and SQLite database files before the first commit.
