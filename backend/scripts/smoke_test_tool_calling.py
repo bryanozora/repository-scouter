@@ -5,9 +5,11 @@ scenario, whether it (a) calls the tool, (b) emits valid JSON arguments,
 (c) passes the right `path`, and how long each call takes.
 Results are printed and appended to docs/NOTES.md.
 
-Standalone on purpose: it only needs httpx + python-dotenv and talks to the
-OpenAI-compatible endpoint directly, so it can run before the provider
-abstraction exists.
+Uses the LLM provider abstraction (app.llm.OllamaProvider) for the actual
+chat calls, so this script exercises the same code path the agent loop
+will use. It still talks to Ollama's native /api/version and /api/tags
+endpoints directly with httpx, since those aren't part of the chat
+provider abstraction.
 
 Usage (from backend/):
     python scripts/smoke_test_tool_calling.py
@@ -16,20 +18,23 @@ Usage (from backend/):
 
 import argparse
 import json
-import os
 import statistics
+import sys
 import time
 from datetime import date
 from pathlib import Path
 
 import httpx
-from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NOTES_PATH = REPO_ROOT / "docs" / "NOTES.md"
 
+sys.path.insert(0, str(REPO_ROOT / "backend"))
+from app.config import get_settings  # noqa: E402
+from app.llm import DEFAULT_TEMPERATURE, OllamaProvider  # noqa: E402
+from app.models import Message  # noqa: E402
+
 DEFAULT_MODELS = ["qwen2.5:7b-instruct", "qwen3:8b"]
-TEMPERATURE = 0.2
 REQUEST_TIMEOUT = 300.0  # first call may include model load time
 
 SYSTEM_PROMPT = (
@@ -82,49 +87,35 @@ def ollama_root(base_url: str) -> str:
     return base_url.rstrip("/").removesuffix("/v1")
 
 
-def one_attempt(client: httpx.Client, base_url: str, model: str, prompt: str, expected: str) -> dict:
-    """Run one request and classify the outcome."""
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        "tools": TOOLS,
-        "temperature": TEMPERATURE,
-        "stream": False,
-    }
+def one_attempt(provider: OllamaProvider, prompt: str, expected: str) -> dict:
+    """Run one request through the provider and classify the outcome."""
+    messages = [Message(role="system", content=SYSTEM_PROMPT), Message(role="user", content=prompt)]
     result = {"called": False, "json_valid": False, "path_ok": False, "seconds": 0.0, "note": ""}
     start = time.perf_counter()
     try:
-        resp = client.post(f"{base_url}/chat/completions", json=payload)
-        result["seconds"] = time.perf_counter() - start
-        resp.raise_for_status()
-        message = resp.json()["choices"][0]["message"]
+        response = provider.chat(messages, tools=TOOLS)
     except (httpx.HTTPError, KeyError, ValueError) as exc:
         result["seconds"] = time.perf_counter() - start
         result["note"] = f"request failed: {exc}"
         return result
+    result["seconds"] = time.perf_counter() - start
 
-    calls = message.get("tool_calls") or []
-    if not calls:
+    if not response.tool_calls:
         # Common small-model failure: describing the call as plain text instead.
         result["note"] = "no tool_calls (answered in text)"
         return result
 
-    fn = calls[0].get("function", {})
-    if fn.get("name") != "list_directory":
-        result["note"] = f"wrong tool name: {fn.get('name')!r}"
+    call = response.tool_calls[0]
+    if call.name != "list_directory":
+        result["note"] = f"wrong tool name: {call.name!r}"
         return result
     result["called"] = True
 
-    args = fn.get("arguments")
-    if isinstance(args, str):
-        try:
-            args = json.loads(args)
-        except json.JSONDecodeError:
-            result["note"] = "arguments not valid JSON"
-            return result
+    try:
+        args = json.loads(call.arguments)
+    except json.JSONDecodeError:
+        result["note"] = "arguments not valid JSON"
+        return result
     if not isinstance(args, dict) or not isinstance(args.get("path"), str):
         result["note"] = f"arguments missing string 'path': {args!r}"
         return result
@@ -137,17 +128,18 @@ def one_attempt(client: httpx.Client, base_url: str, model: str, prompt: str, ex
     return result
 
 
-def run_model(client: httpx.Client, base_url: str, model: str, attempts: int) -> list[dict]:
+def run_model(base_url: str, model: str, attempts: int) -> list[dict]:
     """Return one summary row per scenario for this model."""
+    provider = OllamaProvider(base_url=base_url, model=model, timeout=REQUEST_TIMEOUT)
     print(f"\n=== {model} ===")
     print("warm-up call (not counted)...")
-    one_attempt(client, base_url, model, SCENARIOS[0]["prompt"], SCENARIOS[0]["expected_path"])
+    one_attempt(provider, SCENARIOS[0]["prompt"], SCENARIOS[0]["expected_path"])
 
     rows = []
     for sc in SCENARIOS:
         results = []
         for i in range(attempts):
-            r = one_attempt(client, base_url, model, sc["prompt"], sc["expected_path"])
+            r = one_attempt(provider, sc["prompt"], sc["expected_path"])
             results.append(r)
             status = "ok " if r["path_ok"] else "BAD"
             print(f"  [{sc['name']}] {i + 1:>2}/{attempts} {status} {r['seconds']:.1f}s {r['note']}")
@@ -172,7 +164,7 @@ def render_markdown(rows: list[dict], ollama_version: str, skipped: list[str], a
     lines = [
         f"## Tool-calling smoke test — {date.today().isoformat()}",
         "",
-        f"Ollama {ollama_version}, temperature {TEMPERATURE}, {attempts} attempts per scenario, "
+        f"Ollama {ollama_version}, temperature {DEFAULT_TEMPERATURE}, {attempts} attempts per scenario, "
         "one `list_directory(path)` tool, one warm-up call excluded from timings.",
         "",
         "| Model | Scenario | Tool called | Valid JSON | Correct path | Avg s | Median s |",
@@ -202,10 +194,12 @@ def main() -> None:
     parser.add_argument("--no-write", action="store_true", help="print only, don't touch docs/NOTES.md")
     args = parser.parse_args()
 
-    load_dotenv(REPO_ROOT / ".env")
-    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
+    base_url = get_settings().ollama_base_url.rstrip("/")
     root = ollama_root(base_url)
 
+    # Native Ollama endpoints (not part of the OpenAI-compatible chat API,
+    # so not covered by the provider abstraction) -- used only to check
+    # what's installed before running the chat smoke test through it.
     with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
         try:
             version = client.get(f"{root}/api/version").json().get("version", "unknown")
@@ -213,14 +207,14 @@ def main() -> None:
         except httpx.HTTPError as exc:
             raise SystemExit(f"Cannot reach Ollama at {root}: {exc}\nIs `ollama serve` running?")
 
-        rows, skipped = [], []
-        for model in args.models:
-            if model not in installed:
-                msg = f"`{model}` is not installed (run `ollama pull {model}`)."
-                print(f"\nSkipping {model}: not installed")
-                skipped.append(msg)
-                continue
-            rows.extend(run_model(client, base_url, model, args.attempts))
+    rows, skipped = [], []
+    for model in args.models:
+        if model not in installed:
+            msg = f"`{model}` is not installed (run `ollama pull {model}`)."
+            print(f"\nSkipping {model}: not installed")
+            skipped.append(msg)
+            continue
+        rows.extend(run_model(base_url, model, args.attempts))
 
     if not rows:
         raise SystemExit("No models were tested.")
