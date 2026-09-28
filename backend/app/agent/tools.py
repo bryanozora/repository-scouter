@@ -149,6 +149,7 @@ class RepoTools:
         self.max_tool_result_chars = settings.max_tool_result_chars
         self._tree: github_client.RepoTree | None = None
         self._read_paths: set[str] = set()
+        self._listed_paths: set[str] = set()
 
     def _get_tree(self) -> github_client.RepoTree:
         """Fetch the full recursive tree once and reuse it for every call."""
@@ -167,6 +168,8 @@ class RepoTools:
         err = _validate_path(norm)
         if err:
             return f"Error: {err}"
+        if norm in self._listed_paths:
+            return f"Note: {norm!r} was already listed earlier in this session; use read_file on one of its files to continue."
         if _is_skipped(norm):
             return f"Error: {norm!r} is a vendored/build directory and is not listed."
 
@@ -191,24 +194,27 @@ class RepoTools:
             children[rest] = entry
 
         if not children:
-            return "(empty directory)"
+            result = "(empty directory)"
+        else:
+            names = sorted(children)
+            truncated_note = ""
+            if len(names) > MAX_LIST_ENTRIES:
+                remaining = len(names) - MAX_LIST_ENTRIES
+                names = names[:MAX_LIST_ENTRIES]
+                truncated_note = f"\n... and {remaining} more entries (truncated)"
 
-        names = sorted(children)
-        truncated_note = ""
-        if len(names) > MAX_LIST_ENTRIES:
-            remaining = len(names) - MAX_LIST_ENTRIES
-            names = names[:MAX_LIST_ENTRIES]
-            truncated_note = f"\n... and {remaining} more entries (truncated)"
+            lines = []
+            for name in names:
+                entry = children[name]
+                if entry.type == "tree":
+                    lines.append(f"dir  {name}")
+                else:
+                    size = f" ({entry.size}B)" if entry.size is not None else ""
+                    lines.append(f"file {name}{size}")
+            result = "\n".join(lines) + truncated_note
 
-        lines = []
-        for name in names:
-            entry = children[name]
-            if entry.type == "tree":
-                lines.append(f"dir  {name}")
-            else:
-                size = f" ({entry.size}B)" if entry.size is not None else ""
-                lines.append(f"file {name}{size}")
-        return "\n".join(lines) + truncated_note
+        self._listed_paths.add(norm)
+        return result
 
     def read_file(self, path: str, start: object = None, end: object = None) -> str:
         try:

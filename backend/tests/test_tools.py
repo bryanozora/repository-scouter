@@ -100,6 +100,27 @@ def test_list_directory_lists_nested_directory(monkeypatch):
     assert "README.md" not in result
 
 
+def test_list_directory_returns_already_listed_note_on_repeat(monkeypatch):
+    rt = make_repo_tools(monkeypatch)
+
+    first = rt.list_directory("")
+    second = rt.list_directory("")
+
+    assert "dir  src" in first
+    assert "already listed" in second.lower()
+    assert "dir  src" not in second
+
+
+def test_list_directory_different_paths_do_not_trigger_already_listed_note(monkeypatch):
+    rt = make_repo_tools(monkeypatch)
+
+    root = rt.list_directory("")
+    src = rt.list_directory("src")
+
+    assert "already listed" not in root.lower()
+    assert "already listed" not in src.lower()
+
+
 def test_list_directory_rejects_dotdot(monkeypatch):
     rt = make_repo_tools(monkeypatch)
 

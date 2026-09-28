@@ -26,6 +26,10 @@ class Settings:
     max_steps: int
     max_file_bytes: int
     max_tool_result_chars: int
+    # Defaulted (rather than required) so existing Settings(...) call sites
+    # that predate these two fields don't have to change.
+    tool_timeout_seconds: float = 15.0
+    scan_timeout_seconds: float = 120.0
 
 
 def get_settings() -> Settings:
@@ -43,4 +47,6 @@ def get_settings() -> Settings:
         max_steps=int(os.getenv("MAX_STEPS", "12")),
         max_file_bytes=int(os.getenv("MAX_FILE_BYTES", "100000")),
         max_tool_result_chars=int(os.getenv("MAX_TOOL_RESULT_CHARS", "6000")),
+        tool_timeout_seconds=float(os.getenv("TOOL_TIMEOUT_SECONDS", "15")),
+        scan_timeout_seconds=float(os.getenv("SCAN_TIMEOUT_SECONDS", "120")),
     )

@@ -170,10 +170,10 @@ repository-scouter/
 - [ ] Manually call the GitHub API to list a repo's contents
 
 ### M1 — Agent MVP in the terminal (1–2 days)
-- [ ] Tool-calling smoke test: compare `qwen2.5:7b-instruct` and `qwen3:8b` (if it runs on your Ollama version) on a single-tool-call task through the Ollama OpenAI-compatible endpoint (10 attempts each); record correct tool-call rate, JSON validity, and speed in `docs/NOTES.md`, and pick the default model based on those results
-- [ ] Implement `list_directory` and `read_file` (only these two tools for v1)
-- [ ] Basic agent loop with a step limit (10–15)
-- [ ] **Done when:** `python scan.py <url>` produces a sensible architecture explanation
+- [x] Tool-calling smoke test: compare `qwen2.5:7b-instruct` and `qwen3:8b` (if it runs on your Ollama version) on a single-tool-call task through the Ollama OpenAI-compatible endpoint (10 attempts each); record correct tool-call rate, JSON validity, and speed in `docs/NOTES.md`, and pick the default model based on those results
+- [x] Implement `list_directory` and `read_file` (only these two tools for v1)
+- [x] Basic agent loop with a step limit (10–15)
+- [x] **Done when:** `python scan.py <url>` produces a sensible architecture explanation
 
 ### M2 — Structured findings (2–3 days)
 - [ ] Add `search_code`, `get_dependencies`, `report_finding`
