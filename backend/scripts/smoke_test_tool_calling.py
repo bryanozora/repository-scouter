@@ -1,9 +1,11 @@
 """Tool-calling smoke test for local Ollama models.
 
-Gives a model ONE tool (`list_directory`) and checks, over N attempts per
-scenario, whether it (a) calls the tool, (b) emits valid JSON arguments,
-(c) passes the right `path`, and how long each call takes.
-Results are printed and appended to docs/NOTES.md.
+M1 version: a single-tool sanity check. M2a version (this one): compares
+tool-*selection* accuracy between two tool-set sizes -- 2 tools
+(list_directory, read_file) vs all 4 (+ get_dependencies, search_code) --
+on the same scenarios, to check whether adding tools makes the model worse
+at picking the right one. Uses the real tool schemas from app.agent.tools,
+not hand-rolled ones, so this measures what the agent loop actually sends.
 
 Uses the LLM provider abstraction (app.llm.OllamaProvider) for the actual
 chat calls, so this script exercises the same code path the agent loop
@@ -30,48 +32,30 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 NOTES_PATH = REPO_ROOT / "docs" / "NOTES.md"
 
 sys.path.insert(0, str(REPO_ROOT / "backend"))
+from app.agent.tools import (  # noqa: E402
+    GET_DEPENDENCIES_SCHEMA,
+    LIST_DIRECTORY_SCHEMA,
+    READ_FILE_SCHEMA,
+    SEARCH_CODE_SCHEMA,
+)
 from app.config import get_settings  # noqa: E402
 from app.llm import DEFAULT_TEMPERATURE, OllamaProvider  # noqa: E402
 from app.models import Message  # noqa: E402
 
-DEFAULT_MODELS = ["qwen2.5:7b-instruct", "qwen3:8b"]
+# Only the production default -- this is about tool-set size, not a
+# model comparison (that's already recorded from the M1 smoke test above).
+DEFAULT_MODELS = ["qwen2.5:7b-instruct"]
 REQUEST_TIMEOUT = 300.0  # first call may include model load time
 
 SYSTEM_PROMPT = (
     "You are a code exploration assistant. "
-    "Use the provided tool to inspect the repository. Do not guess folder contents."
+    "Use the provided tools to inspect the repository. Do not guess folder contents."
 )
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "list_directory",
-            "description": "List the files and folders inside a directory of the repository.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory path relative to the repo root. Use '' for the root.",
-                    }
-                },
-                "required": ["path"],
-            },
-        },
-    }
-]
-
-# Two scenarios with different expected `path` arguments, so we test whether
-# the model copies varied arguments from the prompt rather than one fixed string.
-SCENARIOS = [
-    {"name": "short-path", "prompt": "What files are in the src folder?", "expected_path": "src"},
-    {
-        "name": "nested-path",
-        "prompt": "Show me what is inside backend/app/agent.",
-        "expected_path": "backend/app/agent",
-    },
-]
+TOOL_SETS = {
+    "2-tool": [LIST_DIRECTORY_SCHEMA, READ_FILE_SCHEMA],
+    "4-tool": [LIST_DIRECTORY_SCHEMA, READ_FILE_SCHEMA, GET_DEPENDENCIES_SCHEMA, SEARCH_CODE_SCHEMA],
+}
 
 
 def normalize_path(p: str) -> str:
@@ -87,13 +71,68 @@ def ollama_root(base_url: str) -> str:
     return base_url.rstrip("/").removesuffix("/v1")
 
 
-def one_attempt(provider: OllamaProvider, prompt: str, expected: str) -> dict:
+def _expect_list_directory_path(expected_path: str):
+    def check(args: dict) -> bool:
+        path = args.get("path")
+        return isinstance(path, str) and normalize_path(path) == expected_path
+
+    return check
+
+
+def _expect_query_containing(substring: str):
+    def check(args: dict) -> bool:
+        query = args.get("query")
+        return isinstance(query, str) and substring.lower() in query.lower()
+
+    return check
+
+
+def _expect_any_args(args: dict) -> bool:
+    return True  # get_dependencies takes no meaningful args
+
+
+# Two scenarios carried over from M1 (list_directory, meaningful with either
+# tool-set size) plus two new ones (only meaningful with all 4 tools
+# available, since the "correct" tool doesn't exist in the 2-tool set).
+SCENARIOS = [
+    {
+        "name": "short-path",
+        "prompt": "What files are in the src folder?",
+        "expected_tool": "list_directory",
+        "check_args": _expect_list_directory_path("src"),
+        "tool_sets": ["2-tool", "4-tool"],
+    },
+    {
+        "name": "nested-path",
+        "prompt": "Show me what is inside backend/app/agent.",
+        "expected_tool": "list_directory",
+        "check_args": _expect_list_directory_path("backend/app/agent"),
+        "tool_sets": ["2-tool", "4-tool"],
+    },
+    {
+        "name": "dependencies",
+        "prompt": "What are this project's dependencies?",
+        "expected_tool": "get_dependencies",
+        "check_args": _expect_any_args,
+        "tool_sets": ["4-tool"],
+    },
+    {
+        "name": "search-term",
+        "prompt": "Find every place in the code that mentions the word 'password'.",
+        "expected_tool": "search_code",
+        "check_args": _expect_query_containing("password"),
+        "tool_sets": ["4-tool"],
+    },
+]
+
+
+def one_attempt(provider: OllamaProvider, prompt: str, expected_tool: str, check_args, tools: list[dict]) -> dict:
     """Run one request through the provider and classify the outcome."""
     messages = [Message(role="system", content=SYSTEM_PROMPT), Message(role="user", content=prompt)]
-    result = {"called": False, "json_valid": False, "path_ok": False, "seconds": 0.0, "note": ""}
+    result = {"called": False, "json_valid": False, "args_ok": False, "seconds": 0.0, "note": ""}
     start = time.perf_counter()
     try:
-        response = provider.chat(messages, tools=TOOLS)
+        response = provider.chat(messages, tools=tools)
     except (httpx.HTTPError, KeyError, ValueError) as exc:
         result["seconds"] = time.perf_counter() - start
         result["note"] = f"request failed: {exc}"
@@ -106,81 +145,92 @@ def one_attempt(provider: OllamaProvider, prompt: str, expected: str) -> dict:
         return result
 
     call = response.tool_calls[0]
-    if call.name != "list_directory":
-        result["note"] = f"wrong tool name: {call.name!r}"
+    if call.name != expected_tool:
+        result["note"] = f"wrong tool: called {call.name!r}, expected {expected_tool!r}"
         return result
     result["called"] = True
 
     try:
-        args = json.loads(call.arguments)
+        args = json.loads(call.arguments) if call.arguments else {}
     except json.JSONDecodeError:
         result["note"] = "arguments not valid JSON"
         return result
-    if not isinstance(args, dict) or not isinstance(args.get("path"), str):
-        result["note"] = f"arguments missing string 'path': {args!r}"
+    if not isinstance(args, dict):
+        result["note"] = f"arguments not a JSON object: {args!r}"
         return result
     result["json_valid"] = True
 
-    if normalize_path(args["path"]) == expected:
-        result["path_ok"] = True
+    if check_args(args):
+        result["args_ok"] = True
     else:
-        result["note"] = f"wrong path: {args['path']!r} (expected {expected!r})"
+        result["note"] = f"args did not match expectation: {args!r}"
     return result
 
 
+def run_scenario(provider: OllamaProvider, scenario: dict, tool_set_name: str, model: str, attempts: int) -> dict:
+    """Return one summary row for this scenario run under one tool-set size."""
+    tools = TOOL_SETS[tool_set_name]
+    print(f"\n=== {model} / {tool_set_name} / {scenario['name']} ===")
+    results = []
+    for i in range(attempts):
+        r = one_attempt(provider, scenario["prompt"], scenario["expected_tool"], scenario["check_args"], tools)
+        results.append(r)
+        status = "ok " if r["args_ok"] else "BAD"
+        print(f"  {i + 1:>2}/{attempts} {status} {r['seconds']:.1f}s {r['note']}")
+    times = [r["seconds"] for r in results]
+    return {
+        "model": model,
+        "scenario": scenario["name"],
+        "tool_set": tool_set_name,
+        "n": attempts,
+        "called": sum(r["called"] for r in results),
+        "json_valid": sum(r["json_valid"] for r in results),
+        "args_ok": sum(r["args_ok"] for r in results),
+        "avg_s": statistics.mean(times),
+        "median_s": statistics.median(times),
+        "notes": sorted({r["note"] for r in results if r["note"]}),
+    }
+
+
 def run_model(base_url: str, model: str, attempts: int) -> list[dict]:
-    """Return one summary row per scenario for this model."""
+    """Return one summary row per (scenario, tool-set) combination for this model."""
     provider = OllamaProvider(base_url=base_url, model=model, timeout=REQUEST_TIMEOUT)
-    print(f"\n=== {model} ===")
+    print(f"\n### {model} ###")
     print("warm-up call (not counted)...")
-    one_attempt(provider, SCENARIOS[0]["prompt"], SCENARIOS[0]["expected_path"])
+    warmup = SCENARIOS[0]
+    one_attempt(provider, warmup["prompt"], warmup["expected_tool"], warmup["check_args"], TOOL_SETS["2-tool"])
 
     rows = []
-    for sc in SCENARIOS:
-        results = []
-        for i in range(attempts):
-            r = one_attempt(provider, sc["prompt"], sc["expected_path"])
-            results.append(r)
-            status = "ok " if r["path_ok"] else "BAD"
-            print(f"  [{sc['name']}] {i + 1:>2}/{attempts} {status} {r['seconds']:.1f}s {r['note']}")
-        times = [r["seconds"] for r in results]
-        rows.append(
-            {
-                "model": model,
-                "scenario": sc["name"],
-                "n": attempts,
-                "called": sum(r["called"] for r in results),
-                "json_valid": sum(r["json_valid"] for r in results),
-                "path_ok": sum(r["path_ok"] for r in results),
-                "avg_s": statistics.mean(times),
-                "median_s": statistics.median(times),
-                "notes": sorted({r["note"] for r in results if r["note"]}),
-            }
-        )
+    for scenario in SCENARIOS:
+        for tool_set_name in scenario["tool_sets"]:
+            rows.append(run_scenario(provider, scenario, tool_set_name, model, attempts))
     return rows
 
 
 def render_markdown(rows: list[dict], ollama_version: str, skipped: list[str], attempts: int) -> str:
     lines = [
-        f"## Tool-calling smoke test — {date.today().isoformat()}",
+        f"## Tool-set-size smoke test (M2a) — {date.today().isoformat()}",
         "",
-        f"Ollama {ollama_version}, temperature {DEFAULT_TEMPERATURE}, {attempts} attempts per scenario, "
-        "one `list_directory(path)` tool, one warm-up call excluded from timings.",
+        f"Ollama {ollama_version}, temperature {DEFAULT_TEMPERATURE}, {attempts} attempts per "
+        "(scenario, tool-set) combination, one warm-up call excluded from timings. Tool schemas "
+        "are the real ones from app.agent.tools, not hand-rolled. `short-path`/`nested-path` run "
+        "under both tool-set sizes (the accuracy comparison); `dependencies`/`search-term` only "
+        "make sense with all 4 tools available.",
         "",
-        "| Model | Scenario | Tool called | Valid JSON | Correct path | Avg s | Median s |",
-        "|---|---|---|---|---|---|---|",
+        "| Model | Tool set | Scenario | Tool called | Valid JSON | Args OK | Avg s | Median s |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         n = r["n"]
         lines.append(
-            f"| `{r['model']}` | {r['scenario']} | {r['called']}/{n} | {r['json_valid']}/{n} "
-            f"| {r['path_ok']}/{n} | {r['avg_s']:.1f} | {r['median_s']:.1f} |"
+            f"| `{r['model']}` | {r['tool_set']} | {r['scenario']} | {r['called']}/{n} | {r['json_valid']}/{n} "
+            f"| {r['args_ok']}/{n} | {r['avg_s']:.1f} | {r['median_s']:.1f} |"
         )
-    failures = [(r["model"], r["scenario"], r["notes"]) for r in rows if r["notes"]]
+    failures = [(r["model"], r["tool_set"], r["scenario"], r["notes"]) for r in rows if r["notes"]]
     if failures:
         lines += ["", "Failure notes:"]
-        for model, scenario, notes in failures:
-            lines.append(f"- `{model}` / {scenario}: " + "; ".join(notes))
+        for model, tool_set, scenario, notes in failures:
+            lines.append(f"- `{model}` / {tool_set} / {scenario}: " + "; ".join(notes))
     for s in skipped:
         lines += ["", f"Skipped: {s}"]
     lines.append("")

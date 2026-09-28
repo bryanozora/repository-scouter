@@ -41,6 +41,8 @@ class ToolExecutor(Protocol):
 
     def list_directory(self, path: str) -> str: ...
     def read_file(self, path: str, start: object = None, end: object = None) -> str: ...
+    def get_dependencies(self) -> str: ...
+    def search_code(self, query: str) -> str: ...
 
 
 def run_scan(
@@ -162,6 +164,10 @@ def _dispatch_tool(repo_tools: ToolExecutor, name: str, args: dict) -> str:
         return repo_tools.list_directory(args.get("path", ""))
     if name == "read_file":
         return repo_tools.read_file(args.get("path", ""), start=args.get("start"), end=args.get("end"))
+    if name == "get_dependencies":
+        return repo_tools.get_dependencies()
+    if name == "search_code":
+        return repo_tools.search_code(args.get("query", ""))
     return f"Error: unknown tool {name!r}"
 
 

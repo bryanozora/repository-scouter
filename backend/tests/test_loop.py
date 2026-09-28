@@ -55,12 +55,23 @@ class ScriptedProvider:
 class FakeRepoTools:
     """A minimal stand-in for RepoTools, recording calls."""
 
-    def __init__(self, list_directory_result="dir  src\nfile README.md (10B)", read_file_results=None, delay=0.0):
+    def __init__(
+        self,
+        list_directory_result="dir  src\nfile README.md (10B)",
+        read_file_results=None,
+        delay=0.0,
+        dependencies_result="<file_content>\nrequirements.txt:\nhttpx>=0.27\n</file_content>",
+        search_code_result="<file_content>\nNo matches.\n</file_content>",
+    ):
         self.list_directory_calls: list[str] = []
         self.read_file_calls: list[tuple[str, object, object]] = []
+        self.get_dependencies_calls: int = 0
+        self.search_code_calls: list[str] = []
         self._list_result = list_directory_result
         self._read_results = read_file_results or {}
         self._delay = delay
+        self._dependencies_result = dependencies_result
+        self._search_code_result = search_code_result
 
     def list_directory(self, path):
         self.list_directory_calls.append(path)
@@ -71,6 +82,14 @@ class FakeRepoTools:
             time.sleep(self._delay)
         self.read_file_calls.append((path, start, end))
         return self._read_results.get(path, f"<file_content>\ncontent of {path}\n</file_content>")
+
+    def get_dependencies(self):
+        self.get_dependencies_calls += 1
+        return self._dependencies_result
+
+    def search_code(self, query):
+        self.search_code_calls.append(query)
+        return self._search_code_result
 
 
 def make_fake_clock(*values):
@@ -133,6 +152,39 @@ def test_run_scan_executes_tool_call_and_continues():
     second_call_messages = provider.calls[1][0]
     tool_messages = [m for m in second_call_messages if m.role == "tool"]
     assert any("dir  src" in m.content for m in tool_messages)
+
+
+def test_run_scan_dispatches_get_dependencies_tool_call():
+    provider = ScriptedProvider(
+        [
+            LLMResponse(content=None, tool_calls=[ToolCall(id="call_1", name="get_dependencies", arguments="{}")]),
+            LLMResponse(content="done", tool_calls=[]),
+        ]
+    )
+    repo_tools = FakeRepoTools()
+
+    result = loop.run_scan(REF, "main", provider, repo_tools, settings=make_settings())
+
+    assert result == "done"
+    assert repo_tools.get_dependencies_calls == 1
+
+
+def test_run_scan_dispatches_search_code_tool_call():
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[ToolCall(id="call_1", name="search_code", arguments='{"query": "password"}')],
+            ),
+            LLMResponse(content="done", tool_calls=[]),
+        ]
+    )
+    repo_tools = FakeRepoTools()
+
+    result = loop.run_scan(REF, "main", provider, repo_tools, settings=make_settings())
+
+    assert result == "done"
+    assert repo_tools.search_code_calls == ["password"]
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +359,18 @@ def test_initial_user_message_reminds_not_to_relist_root():
     lowered = msg.lower()
     assert "do not call list_directory" in lowered
     assert "readme" in lowered
+
+
+def test_system_prompt_describes_get_dependencies_and_search_code():
+    lowered = prompts.SYSTEM_PROMPT.lower()
+    assert "get_dependencies" in lowered
+    assert "search_code" in lowered
+
+
+def test_system_prompt_says_to_confirm_search_matches_with_read_file():
+    lowered = prompts.SYSTEM_PROMPT.lower()
+    assert "confirm" in lowered
+    assert "candidate" in lowered
 
 
 # ---------------------------------------------------------------------------
