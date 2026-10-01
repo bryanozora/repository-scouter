@@ -1,0 +1,28 @@
+{
+  "description": "Flask + sqlite3 notes API with two SQL injections and two hardcoded secrets.",
+  "language": "Python",
+  "bugs": [
+    {"id": "notes-smtp-password", "issue_type": "hardcoded_secret", "file": "config.py", "line_start": 17, "line_end": 17,
+     "note": "SMTP password written as a literal."},
+    {"id": "notes-analytics-key", "issue_type": "hardcoded_secret", "file": "config.py", "line_start": 22, "line_end": 22,
+     "note": "Analytics API key written as a literal."},
+    {"id": "notes-search-fstring", "issue_type": "sql_injection", "file": "db.py", "line_start": 24, "line_end": 25,
+     "note": "owner and term formatted into the query with an f-string."},
+    {"id": "notes-tag-concat", "issue_type": "sql_injection", "file": "db.py", "line_start": 42, "line_end": 43,
+     "note": "tag concatenated into the query with +."}
+  ],
+  "decoys": [
+    {"id": "notes-secret-key-placeholder", "issue_type": "hardcoded_secret", "file": "config.py", "line_start": 6, "line_end": 6,
+     "note": "Obvious placeholder value."},
+    {"id": "notes-search-key-env", "issue_type": "hardcoded_secret", "file": "config.py", "line_start": 11, "line_end": 11,
+     "note": "Read from the environment."},
+    {"id": "notes-env-example-placeholder", "issue_type": "hardcoded_secret", "file": ".env.example", "line_start": 3, "line_end": 3,
+     "note": "Placeholder in an example env file."},
+    {"id": "notes-flask-config-reference", "issue_type": "hardcoded_secret", "file": "app.py", "line_start": 9, "line_end": 9,
+     "note": "Assigns a reference to config, not a literal."},
+    {"id": "notes-get-note-param", "issue_type": "sql_injection", "file": "db.py", "line_start": 17, "line_end": 17,
+     "note": "Parameterized query (?)."},
+    {"id": "notes-delete-param", "issue_type": "sql_injection", "file": "db.py", "line_start": 32, "line_end": 35,
+     "note": "Parameterized query (?), split across lines."}
+  ]
+}

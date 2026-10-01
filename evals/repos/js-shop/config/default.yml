@@ -1,0 +1,11 @@
+server:
+  port: 3000
+
+database:
+  host: localhost
+  db_password: ${DB_PASSWORD}
+
+
+webhooks:
+  endpoint: /hooks/payments
+  signing_secret: hook-7f3a9c2e1b8d4f60

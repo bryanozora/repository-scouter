@@ -1,0 +1,23 @@
+{
+  "description": "Postgres inventory service with no planted bugs. Every suspicious-looking line is a decoy, so any verified finding here is a false positive.",
+  "language": "Python",
+  "bugs": [],
+  "decoys": [
+    {"id": "clean-api-token-env", "issue_type": "hardcoded_secret", "file": "inventory/settings.py", "line_start": 8, "line_end": 8,
+     "note": "Read from the environment."},
+    {"id": "clean-admin-password-env-default", "issue_type": "hardcoded_secret", "file": "inventory/settings.py", "line_start": 12, "line_end": 12,
+     "note": "Environment lookup with an empty default."},
+    {"id": "clean-session-secret-placeholder", "issue_type": "hardcoded_secret", "file": "inventory/settings.py", "line_start": 15, "line_end": 15,
+     "note": "Obvious placeholder value."},
+    {"id": "clean-test-password", "issue_type": "hardcoded_secret", "file": "tests/test_db.py", "line_start": 3, "line_end": 3,
+     "note": "Clearly fake test value."},
+    {"id": "clean-get-item-param", "issue_type": "sql_injection", "file": "inventory/db.py", "line_start": 14, "line_end": 14,
+     "note": "Parameterized query (%s with a bound tuple)."},
+    {"id": "clean-restock-log-fstring", "issue_type": "sql_injection", "file": "inventory/db.py", "line_start": 18, "line_end": 18,
+     "note": "f-string, but a log message, not SQL."},
+    {"id": "clean-restock-param", "issue_type": "sql_injection", "file": "inventory/db.py", "line_start": 22, "line_end": 25,
+     "note": "Parameterized UPDATE, split across lines."},
+    {"id": "clean-items-below-named-param", "issue_type": "sql_injection", "file": "inventory/db.py", "line_start": 30, "line_end": 30,
+     "note": "Named parameter %(t)s with a bound dict."}
+  ]
+}

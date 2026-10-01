@@ -1,0 +1,24 @@
+{
+  "description": "Express + mysql2 order service with two SQL injections and two hardcoded secrets (one in YAML config).",
+  "language": "JavaScript",
+  "bugs": [
+    {"id": "shop-payment-token", "issue_type": "hardcoded_secret", "file": "src/payments.js", "line_start": 7, "line_end": 7,
+     "note": "Payment gateway token written as a literal."},
+    {"id": "shop-webhook-secret", "issue_type": "hardcoded_secret", "file": "config/default.yml", "line_start": 11, "line_end": 11,
+     "note": "Webhook signing secret as an unquoted YAML value."},
+    {"id": "shop-orders-template", "issue_type": "sql_injection", "file": "src/routes/orders.js", "line_start": 15, "line_end": 17,
+     "note": "req.query.customer interpolated into a template literal query."},
+    {"id": "shop-status-concat", "issue_type": "sql_injection", "file": "src/routes/orders.js", "line_start": 23, "line_end": 24,
+     "note": "req.body.status and req.params.id concatenated into an UPDATE."}
+  ],
+  "decoys": [
+    {"id": "shop-db-password-env", "issue_type": "hardcoded_secret", "file": "src/db.js", "line_start": 6, "line_end": 6,
+     "note": "Read from process.env."},
+    {"id": "shop-yaml-env-reference", "issue_type": "hardcoded_secret", "file": "config/default.yml", "line_start": 6, "line_end": 6,
+     "note": "${DB_PASSWORD} environment reference."},
+    {"id": "shop-bearer-header", "issue_type": "hardcoded_secret", "file": "src/payments.js", "line_start": 17, "line_end": 17,
+     "note": "Uses the token by reference; the literal itself is on line 7."},
+    {"id": "shop-order-by-id-param", "issue_type": "sql_injection", "file": "src/routes/orders.js", "line_start": 8, "line_end": 8,
+     "note": "Parameterized query (?)."}
+  ]
+}
