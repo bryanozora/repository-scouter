@@ -13,7 +13,7 @@ import respx
 
 from app.config import Settings
 from app.llm import OllamaProvider, get_provider
-from app.models import Message
+from app.models import Message, TokenUsage
 
 BASE_URL = "http://localhost:11434/v1"
 
@@ -125,6 +125,21 @@ def test_chat_omits_tools_key_when_no_tools_given():
 
     sent = json.loads(route.calls.last.request.content)
     assert "tools" not in sent
+    assert "response_format" not in sent
+
+
+@respx.mock
+def test_chat_passes_response_format_through():
+    route = respx.post(f"{BASE_URL}/chat/completions").mock(
+        return_value=httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+    )
+    provider = OllamaProvider(base_url=BASE_URL, model="qwen2.5:7b-instruct")
+    fmt = {"type": "json_schema", "json_schema": {"name": "report", "schema": {"type": "object"}}}
+
+    provider.chat([Message(role="user", content="hi")], response_format=fmt)
+
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["response_format"] == fmt
 
 
 @respx.mock
@@ -147,3 +162,37 @@ def test_get_provider_returns_ollama_provider_for_ollama_setting():
 def test_get_provider_raises_for_unknown_provider():
     with pytest.raises(ValueError):
         get_provider(make_settings(llm_provider="openai"))
+
+
+@respx.mock
+def test_chat_parses_token_usage_when_present():
+    respx.post(f"{BASE_URL}/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+                "usage": {"prompt_tokens": 1955, "completion_tokens": 8, "total_tokens": 1963},
+            },
+        )
+    )
+    provider = OllamaProvider(base_url=BASE_URL, model="qwen2.5:7b-instruct")
+
+    response = provider.chat([Message(role="user", content="hi")])
+
+    assert response.usage == TokenUsage(prompt_tokens=1955, completion_tokens=8)
+
+
+@respx.mock
+def test_chat_leaves_usage_none_when_missing_or_malformed():
+    route = respx.post(f"{BASE_URL}/chat/completions")
+    provider = OllamaProvider(base_url=BASE_URL, model="qwen2.5:7b-instruct")
+
+    route.mock(return_value=httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}]}))
+    assert provider.chat([Message(role="user", content="hi")]).usage is None
+
+    route.mock(
+        return_value=httpx.Response(
+            200, json={"choices": [{"message": {"content": "hi"}}], "usage": {"prompt_tokens": "lots"}}
+        )
+    )
+    assert provider.chat([Message(role="user", content="hi")]).usage is None

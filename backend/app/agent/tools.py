@@ -24,6 +24,18 @@ from pathlib import PurePosixPath
 from typing import Callable
 
 from . import manifests
+from .findings import (
+    ISSUE_TYPES,
+    MAX_FINDINGS,
+    REQUIRED_FIELDS,
+    SEVERITIES,
+    V1_CATEGORIES,
+    Finding,
+    check_evidence,
+    format_validation_errors,
+    validate_finding_args,
+)
+from .paths import normalize_path, validate_path
 from .. import github_client
 from ..config import Settings, get_settings
 
@@ -88,6 +100,13 @@ MAX_SEARCH_LINE_CHARS = 200
 # few in flight at once meaningfully improves coverage within the time budget
 # without needing a large worker pool.
 SEARCH_CONCURRENCY = 5
+
+# candidate_search (approach 3): fixed terms the loop searches for before the
+# model's first turn, and how much of that goes into the first message. Kept
+# small -- ~20 lines is roughly 600 tokens of the 3300-token prompt budget.
+CANDIDATE_TERMS = ("password", "secret", "token", "key", "SELECT", "execute(")
+CANDIDATE_LINES_PER_TERM = 4
+MAX_CANDIDATE_LINES = 20
 
 LIST_DIRECTORY_SCHEMA = {
     "type": "function",
@@ -159,24 +178,35 @@ SEARCH_CODE_SCHEMA = {
     },
 }
 
-TOOLS = [LIST_DIRECTORY_SCHEMA, READ_FILE_SCHEMA, GET_DEPENDENCIES_SCHEMA, SEARCH_CODE_SCHEMA]
+# Short descriptions on purpose: every character here is resent on every
+# call, and the model's context window is small (see docs/NOTES.md).
+REPORT_FINDING_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "report_finding",
+        "description": (
+            "Record one security issue you have confirmed with read_file. "
+            "Rejected if you have not seen the cited lines (via read_file or search_code)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "severity": {"type": "string", "enum": list(SEVERITIES)},
+                "category": {"type": "string", "enum": list(V1_CATEGORIES)},
+                "issue_type": {"type": "string", "enum": list(ISSUE_TYPES)},
+                "file": {"type": "string", "description": "File path relative to the repo root."},
+                "line_start": {"type": "integer", "description": "First line of the evidence (1-based)."},
+                "line_end": {"type": "integer", "description": "Last line of the evidence, at most 30 lines after line_start."},
+                "description": {"type": "string", "description": "What is wrong, in one or two sentences."},
+                "suggestion": {"type": "string", "description": "How to fix it (optional)."},
+                "confidence": {"type": "number", "description": "0.0 to 1.0 (optional, default 0.5)."},
+            },
+            "required": list(REQUIRED_FIELDS),
+        },
+    },
+}
 
-
-def _normalize_path(path: str) -> str:
-    """'./src/' -> 'src', '' stays ''."""
-    p = path.strip().replace("\\", "/")
-    while p.startswith("./"):
-        p = p[2:]
-    return p.strip("/")
-
-
-def _validate_path(path: str) -> str | None:
-    """Return an error message if path is unsafe to use, else None."""
-    if path.startswith("/"):
-        return "path must be relative to the repo root, not start with '/'"
-    if ".." in path.split("/"):
-        return "path must not contain '..'"
-    return None
+TOOLS = [LIST_DIRECTORY_SCHEMA, READ_FILE_SCHEMA, GET_DEPENDENCIES_SCHEMA, SEARCH_CODE_SCHEMA, REPORT_FINDING_SCHEMA]
 
 
 def _is_skipped(path: str) -> bool:
@@ -193,6 +223,17 @@ def _coerce_optional_int(value: object, name: str) -> tuple[int | None, str | No
         return int(str(value).strip()), None
     except ValueError:
         return None, f"{name} must be an integer"
+
+
+def _format_line_ranges(lines: set[int]) -> str:
+    """{1, 2, 3, 7, 8, 12} -> '1-3, 7-8, 12'."""
+    spans: list[list[int]] = []
+    for n in sorted(lines):
+        if spans and n == spans[-1][1] + 1:
+            spans[-1][1] = n
+        else:
+            spans.append([n, n])
+    return ", ".join(f"{a}-{b}" if a != b else str(a) for a, b in spans)
 
 
 def _is_low_value_for_search(path: str) -> bool:
@@ -252,8 +293,13 @@ class RepoTools:
         branch: str,
         token: str | None = None,
         settings: Settings | None = None,
+        source: object | None = None,
     ) -> None:
         self.ref = ref
+        # Where trees and file contents come from: the GitHub API by default,
+        # or anything with the same list_tree/read_file interface (e.g.
+        # app.local_source.LocalRepoSource for the evals/repos fixtures).
+        self._source = source if source is not None else github_client
         self.branch = branch
         self.token = token
         settings = settings or get_settings()
@@ -261,17 +307,54 @@ class RepoTools:
         self.max_tool_result_chars = settings.max_tool_result_chars
         self.tool_timeout_seconds = settings.tool_timeout_seconds
         self._tree: github_client.RepoTree | None = None
-        self._read_paths: set[str] = set()
+        # Line numbers actually returned to the model by read_file, per file.
+        # Drives the "already read" note, and (M2b) report_finding only
+        # accepts evidence from lines in here.
+        self._shown_lines: dict[str, set[int]] = {}
+        # Lines shown *in full* as search_code matches, per file. Kept apart
+        # from _shown_lines so read_file's "already read" logic is unaffected;
+        # report_finding accepts evidence from either.
+        self._search_seen_lines: dict[str, set[int]] = {}
         self._listed_paths: set[str] = set()
         self._dependencies_result: str | None = None
         # Shared between read_file and search_code so a file fetched by one
         # isn't re-fetched by the other within the same scan.
         self._content_cache: dict[str, str] = {}
+        # Findings recorded by report_finding. In-memory scan state only --
+        # nothing is ever written back to the scanned repository.
+        self._findings: list[Finding] = []
+
+    @property
+    def findings(self) -> list[Finding]:
+        """A copy of the findings recorded so far (verified and flagged)."""
+        return list(self._findings)
+
+    def shown_lines(self, path: str) -> frozenset[int]:
+        """Line numbers of `path` that read_file has shown in full this scan."""
+        return frozenset(self._shown_lines.get(normalize_path(path), ()))
+
+    def search_seen_lines(self, path: str) -> frozenset[int]:
+        """Line numbers of `path` shown in full as search_code matches this scan."""
+        return frozenset(self._search_seen_lines.get(normalize_path(path), ()))
+
+    def forget_search_lines(self) -> None:
+        """Called by the agent loop when an old search_code result is removed
+        from the conversation. Clears every search-seen line, not just that
+        search's -- deliberately conservative: over-forgetting only means the
+        model must re-read before reporting, never that unseen lines count."""
+        self._search_seen_lines.clear()
+
+    def forget_shown(self, path: str) -> None:
+        """Called by the agent loop when an old read_file result is removed from
+        the conversation to fit the context window: those lines are no longer
+        visible to the model, so they stop counting as evidence (report_finding)
+        and may be read again without an "already read" note."""
+        self._shown_lines.pop(normalize_path(path), None)
 
     def _get_tree(self) -> github_client.RepoTree:
         """Fetch the full recursive tree once and reuse it for every call."""
         if self._tree is None:
-            self._tree = github_client.list_tree(self.ref, self.branch, self.token)
+            self._tree = self._source.list_tree(self.ref, self.branch, self.token)
         return self._tree
 
     def list_directory(self, path: str) -> str:
@@ -281,8 +364,8 @@ class RepoTools:
             return f"Error: unexpected failure listing {path!r}: {exc}"
 
     def _list_directory(self, path: str) -> str:
-        norm = _normalize_path(path)
-        err = _validate_path(norm)
+        norm = normalize_path(path)
+        err = validate_path(norm)
         if err:
             return f"Error: {err}"
         if norm in self._listed_paths:
@@ -340,13 +423,10 @@ class RepoTools:
             return f"Error: unexpected failure reading {path!r}: {exc}"
 
     def _read_file(self, path: str, start: object, end: object) -> str:
-        norm = _normalize_path(path)
-        err = _validate_path(norm)
+        norm = normalize_path(path)
+        err = validate_path(norm)
         if err:
             return f"Error: {err}"
-
-        if norm in self._read_paths:
-            return f"Note: {norm!r} was already read earlier in this session; see the previous tool result."
 
         start_val, err = _coerce_optional_int(start, "start")
         if err:
@@ -378,7 +458,7 @@ class RepoTools:
         content = self._content_cache.get(norm)
         if content is None:
             try:
-                content = github_client.read_file(self.ref, norm, branch=self.branch, token=self.token)
+                content = self._source.read_file(self.ref, norm, branch=self.branch, token=self.token)
             except github_client.GitHubError as exc:
                 return f"Error: {exc}"
             self._content_cache[norm] = content
@@ -394,16 +474,49 @@ class RepoTools:
         if not selected:
             return f"Error: no lines in that range (file has {total_lines} lines)"
 
-        self._read_paths.add(norm)
+        # Only a request for lines that were *all* already shown is a repeat;
+        # a different or wider range of the same file is new information.
+        already_shown = self._shown_lines.get(norm, set())
+        requested = set(range(start_idx + 1, start_idx + len(selected) + 1))
+        if requested <= already_shown:
+            return (
+                f"Note: {norm!r} lines {_format_line_ranges(already_shown)} were already read earlier "
+                "in this session; see the previous tool result."
+            )
 
-        numbered = "\n".join(f"{i}: {line}" for i, line in enumerate(selected, start=start_idx + 1))
+        # Cut at whole lines so "shown" means the model saw the entire line.
+        numbered_lines = [f"{i}: {line}" for i, line in enumerate(selected, start=start_idx + 1)]
+        kept: list[str] = []
+        length = 0
+        for numbered_line in numbered_lines:
+            added = len(numbered_line) + (1 if kept else 0)
+            if length + added > self.max_tool_result_chars:
+                break
+            kept.append(numbered_line)
+            length += added
+
+        first_line = start_idx + 1
+        if kept:
+            last_line = start_idx + len(kept)
+            body = "\n".join(kept)
+            already_shown.update(range(first_line, last_line + 1))
+            self._shown_lines[norm] = already_shown
+        else:
+            # A single line longer than the whole cap (minified code): show a
+            # cut-off piece of it, but don't count it as shown.
+            last_line = first_line
+            body = numbered_lines[0][: self.max_tool_result_chars]
+
         truncated_note = ""
-        if len(numbered) > self.max_tool_result_chars:
-            numbered = numbered[: self.max_tool_result_chars]
-            truncated_note = f"\n... (truncated to {self.max_tool_result_chars} characters)"
+        if len(kept) < len(selected):
+            next_line = last_line + 1 if kept else first_line + 1
+            truncated_note = (
+                f"\n... (truncated to {self.max_tool_result_chars} characters. "
+                f"To see more, call read_file('{norm}', start={next_line}).)"
+            )
 
-        header = f"File: {norm} (lines {start_idx + 1}-{start_idx + len(selected)} of {total_lines})"
-        return f"{header}\n<file_content>\n{numbered}{truncated_note}\n</file_content>"
+        header = f"File: {norm} (lines {first_line}-{last_line} of {total_lines})"
+        return f"{header}\n<file_content>\n{body}{truncated_note}\n</file_content>"
 
     def get_dependencies(self) -> str:
         try:
@@ -447,7 +560,7 @@ class RepoTools:
             content = self._content_cache.get(entry.path)
             if content is None:
                 try:
-                    content = github_client.read_file(self.ref, entry.path, branch=self.branch, token=self.token)
+                    content = self._source.read_file(self.ref, entry.path, branch=self.branch, token=self.token)
                 except github_client.GitHubError as exc:
                     sections.append(f"{entry.path}: (could not fetch: {exc})")
                     continue
@@ -485,14 +598,78 @@ class RepoTools:
             return "Error: query must not be empty"
 
         try:
-            tree = self._get_tree()
+            matches, files_fetched, total_candidates, bounded_reason = self._find_matches(query, now)
         except github_client.GitHubError as exc:
             return f"Error: {exc}"
+        self._mark_search_seen(matches)
 
+        if not matches:
+            body = f"No matches for {query!r} in {files_fetched} file(s) searched."
+        else:
+            body = "\n".join(f"{path}:{lineno}: {snippet}" for path, lineno, snippet, _ in matches)
+
+        if bounded_reason:
+            body += (
+                f"\n\n(Search stopped early: {bounded_reason}. Results may be incomplete -- "
+                f"searched {files_fetched} of {total_candidates} candidate file(s).)"
+            )
+
+        return f"<file_content>\n{body}\n</file_content>"
+
+    def candidate_search(
+        self,
+        terms: tuple[str, ...],
+        per_term: int = CANDIDATE_LINES_PER_TERM,
+        max_lines: int = MAX_CANDIDATE_LINES,
+        now: Callable[[], float] = time.monotonic,
+    ) -> str:
+        """Approach 3: fixed searches run by the agent loop itself before the
+        model's first turn (not a tool the model calls). Returns one compact,
+        de-duplicated block of matching lines -- a few per term, round-robin,
+        so one noisy term ("key") can't crowd out the rest -- or "" if nothing
+        matched. Lines shown here in full count as seen evidence, exactly like
+        a search_code result. Never raises."""
+        try:
+            per_term_hits: list[list[tuple[str, int, str, bool]]] = []
+            for term in terms:
+                matches, _, _, _ = self._find_matches(term, now)
+                per_term_hits.append(matches)
+        except Exception:  # an auto-search failing must never stop the scan
+            return ""
+
+        chosen: list[tuple[str, int, str, bool]] = []
+        seen_keys: set[tuple[str, int]] = set()
+        for rank in range(per_term):
+            for hits in per_term_hits:
+                if rank < len(hits) and len(chosen) < max_lines:
+                    path, lineno, snippet, full = hits[rank]
+                    if (path, lineno) not in seen_keys:
+                        seen_keys.add((path, lineno))
+                        chosen.append((path, lineno, snippet, full))
+        if not chosen:
+            return ""
+        chosen.sort(key=lambda m: (m[0], m[1]))
+        self._mark_search_seen(chosen)
+        body = "\n".join(f"{path}:{lineno}: {snippet}" for path, lineno, snippet, _ in chosen)
+        return f"<file_content>\n{body}\n</file_content>"
+
+    def _mark_search_seen(self, matches: list[tuple[str, int, str, bool]]) -> None:
+        """Lines shown in full (minus indentation) count as seen evidence."""
+        for path, lineno, _, full in matches:
+            if full:
+                self._search_seen_lines.setdefault(path, set()).add(lineno)
+
+    def _find_matches(
+        self, query: str, now: Callable[[], float]
+    ) -> tuple[list[tuple[str, int, str, bool]], int, int, str | None]:
+        """(matches, files_fetched, total_candidates, bounded_reason) for one
+        literal, case-insensitive query. Each match is (path, lineno, snippet,
+        shown_in_full). Raises GitHubError if the tree can't be fetched."""
+        tree = self._get_tree()
         candidates = _select_search_candidates(tree.entries)
         deadline = now() + self.tool_timeout_seconds
 
-        matches: list[tuple[str, int, str]] = []
+        matches: list[tuple[str, int, str, bool]] = []
         files_fetched = 0
         bytes_fetched = 0
         bounded_reason: str | None = None
@@ -531,7 +708,7 @@ class RepoTools:
                         fut.set_result(cached)
                     else:
                         fut = executor.submit(
-                            github_client.read_file, self.ref, entry.path, branch=self.branch, token=self.token
+                            self._source.read_file, self.ref, entry.path, branch=self.branch, token=self.token
                         )
                     batch_futures.append((entry, fut))
 
@@ -558,9 +735,10 @@ class RepoTools:
                     for lineno, line in enumerate(content.splitlines(), start=1):
                         if query.lower() in line.lower():
                             snippet = line.strip()
-                            if len(snippet) > MAX_SEARCH_LINE_CHARS:
+                            full = len(snippet) <= MAX_SEARCH_LINE_CHARS
+                            if not full:
                                 snippet = snippet[:MAX_SEARCH_LINE_CHARS] + "..."
-                            matches.append((entry.path, lineno, snippet))
+                            matches.append((entry.path, lineno, snippet, full))
                             if len(matches) >= MAX_SEARCH_RESULTS:
                                 break
                     if len(matches) >= MAX_SEARCH_RESULTS:
@@ -573,18 +751,99 @@ class RepoTools:
                     bounded_reason = f"reached the {MAX_SEARCH_RESULTS}-match limit"
                     break
 
-        if not matches:
-            body = f"No matches for {query!r} in {files_fetched} file(s) searched."
-        else:
-            body = "\n".join(f"{path}:{lineno}: {snippet}" for path, lineno, snippet in matches)
+        return matches, files_fetched, len(candidates), bounded_reason
 
-        if bounded_reason:
-            body += (
-                f"\n\n(Search stopped early: {bounded_reason}. Results may be incomplete -- "
-                f"searched {files_fetched} of {len(candidates)} candidate file(s).)"
+    def report_finding(self, args: dict, source: str = "tool_call") -> str:
+        """Validate, read-gate, evidence-check and record one finding.
+
+        source says which path it came in through -- "tool_call" (a real
+        report_finding call), "parsed_text" (a finding the model wrote as
+        text), or "forced_json" (the loop's final structured reporting step).
+        Every path goes through exactly the same checks."""
+        try:
+            return self._report_finding(args, source)
+        except Exception as exc:  # tools must never raise into the agent loop
+            return f"Error: unexpected failure recording the finding: {exc}"
+
+    def _report_finding(self, args: dict, source: str) -> str:
+        finding, errors = validate_finding_args(args)
+        if errors:
+            return format_validation_errors(errors)
+        assert finding is not None
+        finding.source = source
+
+        if len(self._findings) >= MAX_FINDINGS:
+            return (
+                f"Error: the limit of {MAX_FINDINGS} findings per scan was reached; nothing was recorded. "
+                "Give your final answer now."
             )
 
-        return f"<file_content>\n{body}\n</file_content>"
+        path, start, end = finding.file, finding.line_start, finding.line_end
+        read_hint = f"read_file('{path}', start={start}, end={end})"
+
+        try:
+            tree = self._get_tree()
+        except github_client.GitHubError as exc:
+            return f"Error: {exc}"
+        entry = next((e for e in tree.entries if e.path == path), None)
+        if entry is None:
+            return format_validation_errors([f"file: {path!r} was not found in the repository"])
+        if entry.type != "blob":
+            return format_validation_errors([f"file: {path!r} is a directory, not a file"])
+
+        # Evidence must be lines the model actually saw: shown by read_file, or
+        # shown in full as a search_code match. Filenames and truncated search
+        # snippets don't count.
+        seen = self._shown_lines.get(path, set()) | self._search_seen_lines.get(path, set())
+        content = self._content_cache.get(path)
+        if not seen or content is None:
+            return format_validation_errors(
+                [
+                    f"file: you have not seen any lines of {path!r} in this scan (via read_file or a "
+                    f"search_code match). Call {read_hint} first, then report it"
+                ]
+            )
+        lines = content.splitlines()
+        if end > len(lines):
+            return format_validation_errors(
+                [f"line_end: {path!r} has only {len(lines)} lines, so lines {start}-{end} do not exist"]
+            )
+        if not set(range(start, end + 1)) <= seen:
+            return format_validation_errors(
+                [
+                    f"line_start: you have only seen lines {_format_line_ranges(seen)} of {path!r}, which do "
+                    f"not include all of lines {start}-{end}. Call {read_hint} first, then report it"
+                ]
+            )
+
+        finding.verified, finding.verification_note = check_evidence(finding.issue_type, path, lines, start, end)
+
+        # An overlapping report of the same kind in the same file: a duplicate
+        # if the earlier one verified; otherwise this is a corrected retry and
+        # replaces it.
+        overlapping = [
+            f
+            for f in self._findings
+            if f.file == path and f.issue_type == finding.issue_type and f.line_start <= end and start <= f.line_end
+        ]
+        verified_dup = next((f for f in overlapping if f.verified), None)
+        if verified_dup is not None:
+            number = self._findings.index(verified_dup) + 1
+            return (
+                f"Note: this was already recorded as finding #{number} ({path} lines "
+                f"{verified_dup.line_start}-{verified_dup.line_end}); not recorded again."
+            )
+        for stale in overlapping:
+            self._findings.remove(stale)
+
+        self._findings.append(finding)
+        number = len(self._findings)
+        if finding.verified:
+            return f"Recorded finding #{number} (verified: {finding.verification_note})."
+        return (
+            f"Recorded finding #{number}, but flagged UNVERIFIED: {finding.verification_note}. It will be listed "
+            "separately as unverified. If you cited the wrong lines, call report_finding again with the correct range."
+        )
 
 
 if __name__ == "__main__":

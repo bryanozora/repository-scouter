@@ -51,8 +51,19 @@ class Message:
 
 
 @dataclass
+class TokenUsage:
+    """Token counts for one chat() call, as reported by the provider."""
+
+    prompt_tokens: int
+    completion_tokens: int
+
+
+@dataclass
 class LLMResponse:
     """The model's reply to one chat() call."""
 
     content: str | None
     tool_calls: list[ToolCall]
+    # None when the provider didn't report usage; the agent loop then
+    # falls back to a rough character-based estimate.
+    usage: TokenUsage | None = None

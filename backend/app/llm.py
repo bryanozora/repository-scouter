@@ -15,7 +15,7 @@ from typing import Any, Protocol
 import httpx
 
 from .config import Settings, get_settings
-from .models import LLMResponse, Message, ToolCall
+from .models import LLMResponse, Message, TokenUsage, ToolCall
 
 # First call to a model may include Ollama loading it into memory, which can
 # take a while on a small machine -- matches the smoke test's timeout.
@@ -27,9 +27,17 @@ class LLMProvider(Protocol):
     """Anything the agent loop can call an LLM through."""
 
     def chat(
-        self, messages: list[Message], tools: list[dict[str, Any]] | None = None
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> LLMResponse:
-        """Send a conversation (+ optional tool schemas) and get one reply."""
+        """Send a conversation (+ optional tool schemas) and get one reply.
+
+        response_format is the OpenAI-style structured-output option, e.g.
+        {"type": "json_schema", "json_schema": {...}}. Verified directly against
+        Ollama 0.10.1: it constrains the output to the schema (docs/NOTES.md).
+        """
         ...
 
 
@@ -49,7 +57,10 @@ class OllamaProvider:
         self.temperature = temperature
 
     def chat(
-        self, messages: list[Message], tools: list[dict[str, Any]] | None = None
+        self,
+        messages: list[Message],
+        tools: list[dict[str, Any]] | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> LLMResponse:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -59,11 +70,14 @@ class OllamaProvider:
         }
         if tools:
             payload["tools"] = tools
+        if response_format:
+            payload["response_format"] = response_format
 
         with httpx.Client(timeout=self.timeout) as client:
             resp = client.post(f"{self.base_url}/chat/completions", json=payload)
         resp.raise_for_status()
-        message = resp.json()["choices"][0]["message"]
+        data = resp.json()
+        message = data["choices"][0]["message"]
 
         tool_calls = [
             ToolCall(
@@ -73,7 +87,19 @@ class OllamaProvider:
             )
             for call in (message.get("tool_calls") or [])
         ]
-        return LLMResponse(content=message.get("content"), tool_calls=tool_calls)
+        return LLMResponse(
+            content=message.get("content"), tool_calls=tool_calls, usage=_parse_usage(data.get("usage"))
+        )
+
+
+def _parse_usage(raw: object) -> TokenUsage | None:
+    """OpenAI-style {"prompt_tokens": n, "completion_tokens": m}, or None if absent/garbled."""
+    if not isinstance(raw, dict):
+        return None
+    prompt, completion = raw.get("prompt_tokens"), raw.get("completion_tokens")
+    if not isinstance(prompt, int) or not isinstance(completion, int):
+        return None
+    return TokenUsage(prompt_tokens=prompt, completion_tokens=completion)
 
 
 def get_provider(settings: Settings | None = None) -> LLMProvider:

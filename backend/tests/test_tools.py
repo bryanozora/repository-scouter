@@ -18,6 +18,7 @@ from app.agent.tools import (
     GET_DEPENDENCIES_SCHEMA,
     LIST_DIRECTORY_SCHEMA,
     READ_FILE_SCHEMA,
+    REPORT_FINDING_SCHEMA,
     SEARCH_CODE_SCHEMA,
     TOOLS,
     RepoTools,
@@ -233,6 +234,46 @@ def test_read_file_rejects_absolute_path(monkeypatch):
     assert result.startswith("Error")
 
 
+def test_read_file_rejects_absolute_path_as_absolute_not_as_missing(monkeypatch):
+    # /etc/passwd must be refused because it's absolute -- not merely
+    # because "etc/passwd" happens not to exist in this repo's tree.
+    read_calls: list = []
+    rt = make_repo_tools(monkeypatch, read_file_calls=read_calls)
+
+    result = rt.read_file("/etc/passwd")
+
+    assert result.startswith("Error")
+    assert "relative to the repo root" in result
+    assert "not found" not in result
+    assert read_calls == []
+
+
+def test_read_file_rejects_absolute_path_even_when_relative_twin_exists(monkeypatch):
+    rt = make_repo_tools(monkeypatch, file_contents={"src/main.py": "line1"})
+
+    result = rt.read_file("/src/main.py")
+
+    assert result.startswith("Error")
+    assert "relative to the repo root" in result
+
+
+def test_list_directory_rejects_absolute_path_even_when_relative_twin_exists(monkeypatch):
+    rt = make_repo_tools(monkeypatch)
+
+    result = rt.list_directory("/src")
+
+    assert result.startswith("Error")
+    assert "relative to the repo root" in result
+
+
+def test_read_file_still_accepts_trailing_slash_and_dot_slash(monkeypatch):
+    rt = make_repo_tools(monkeypatch, file_contents={"src/main.py": "line1"})
+
+    result = rt.read_file("./src/main.py")
+
+    assert "1: line1" in result
+
+
 def test_read_file_rejects_binary_extension_without_fetching(monkeypatch):
     read_calls: list = []
     rt = make_repo_tools(monkeypatch, read_file_calls=read_calls)
@@ -275,6 +316,135 @@ def test_read_file_returns_already_read_note_on_repeat(monkeypatch):
     assert "already read" in second.lower()
     assert "<file_content>" not in second
     assert len(read_calls) == 1
+
+
+TEN_LINES = "\n".join(f"line{i}" for i in range(1, 11))
+TEN_LINE_TREE = RepoTree(entries=[TreeEntry(path="app.py", type="blob", size=len(TEN_LINES))], truncated=False)
+
+
+def test_read_file_allows_reading_a_different_range_of_the_same_file(monkeypatch):
+    read_calls: list = []
+    rt = make_repo_tools(monkeypatch, tree=TEN_LINE_TREE, file_contents={"app.py": TEN_LINES}, read_file_calls=read_calls)
+
+    rt.read_file("app.py", start=1, end=3)
+    second = rt.read_file("app.py", start=6, end=8)
+
+    assert "<file_content>" in second
+    assert "6: line6" in second
+    assert "already read" not in second.lower()
+    assert len(read_calls) == 1  # second range came from the content cache
+
+
+def test_read_file_returns_note_when_requested_range_was_already_fully_shown(monkeypatch):
+    rt = make_repo_tools(monkeypatch, tree=TEN_LINE_TREE, file_contents={"app.py": TEN_LINES})
+
+    rt.read_file("app.py", start=1, end=5)
+    second = rt.read_file("app.py", start=2, end=4)
+
+    assert "already read" in second.lower()
+    assert "<file_content>" not in second
+    assert "1-5" in second
+
+
+def test_read_file_shows_a_partially_overlapping_range_in_full(monkeypatch):
+    rt = make_repo_tools(monkeypatch, tree=TEN_LINE_TREE, file_contents={"app.py": TEN_LINES})
+
+    rt.read_file("app.py", start=1, end=5)
+    second = rt.read_file("app.py", start=4, end=8)
+
+    assert "4: line4" in second
+    assert "8: line8" in second
+
+
+def test_read_file_whole_file_after_a_partial_read_is_not_a_repeat(monkeypatch):
+    rt = make_repo_tools(monkeypatch, tree=TEN_LINE_TREE, file_contents={"app.py": TEN_LINES})
+
+    rt.read_file("app.py", start=1, end=5)
+    second = rt.read_file("app.py")
+
+    assert "10: line10" in second
+
+
+def test_read_file_note_after_two_disjoint_reads_lists_both_ranges(monkeypatch):
+    rt = make_repo_tools(monkeypatch, tree=TEN_LINE_TREE, file_contents={"app.py": TEN_LINES})
+
+    rt.read_file("app.py", start=1, end=2)
+    rt.read_file("app.py", start=7, end=8)
+    third = rt.read_file("app.py", start=7, end=7)
+
+    assert "already read" in third.lower()
+    assert "1-2, 7-8" in third
+
+
+def test_format_line_ranges_collapses_runs():
+    assert tools._format_line_ranges({1, 2, 3, 7, 8, 12}) == "1-3, 7-8, 12"
+    assert tools._format_line_ranges(set()) == ""
+
+
+def test_shown_lines_tracks_exactly_the_lines_returned(monkeypatch):
+    rt = make_repo_tools(monkeypatch, tree=TEN_LINE_TREE, file_contents={"app.py": TEN_LINES})
+
+    assert rt.shown_lines("app.py") == frozenset()
+    rt.read_file("./app.py", start=3, end=4)
+    rt.read_file("app.py", start=9)
+
+    assert rt.shown_lines("app.py") == frozenset({3, 4, 9, 10})
+    assert rt.shown_lines("./app.py") == frozenset({3, 4, 9, 10})
+
+
+def test_failed_reads_do_not_count_as_shown(monkeypatch):
+    rt = make_repo_tools(monkeypatch, tree=TEN_LINE_TREE, file_contents={"app.py": TEN_LINES})
+
+    rt.read_file("app.py", start=50, end=60)  # out of range -> error
+
+    assert rt.shown_lines("app.py") == frozenset()
+
+
+def test_read_file_truncation_cuts_at_whole_lines_and_only_counts_those_as_shown(monkeypatch):
+    # "1: line1" is 8 chars; each further line adds "\n" + 8 = 9 chars.
+    # A 30-char cap fits lines 1-3 (8 + 9 + 9 = 26) but not line 4 (35).
+    settings = make_settings(max_tool_result_chars=30)
+    rt = make_repo_tools(monkeypatch, tree=TEN_LINE_TREE, settings=settings, file_contents={"app.py": TEN_LINES})
+
+    result = rt.read_file("app.py")
+
+    assert "3: line3" in result
+    assert "4: line" not in result
+    assert rt.shown_lines("app.py") == frozenset({1, 2, 3})
+    assert "start=4" in result  # tells the model how to continue
+
+
+def test_read_file_after_truncation_can_continue_from_the_next_line(monkeypatch):
+    settings = make_settings(max_tool_result_chars=30)
+    rt = make_repo_tools(monkeypatch, tree=TEN_LINE_TREE, settings=settings, file_contents={"app.py": TEN_LINES})
+
+    rt.read_file("app.py")
+    second = rt.read_file("app.py", start=4, end=5)
+
+    assert "4: line4" in second
+    assert "already read" not in second.lower()
+
+
+def test_read_file_header_reports_the_lines_actually_shown(monkeypatch):
+    settings = make_settings(max_tool_result_chars=30)
+    rt = make_repo_tools(monkeypatch, tree=TEN_LINE_TREE, settings=settings, file_contents={"app.py": TEN_LINES})
+
+    result = rt.read_file("app.py")
+
+    assert result.startswith("File: app.py (lines 1-3 of 10)")
+
+
+def test_read_file_single_overlong_line_is_cut_but_not_counted_as_shown(monkeypatch):
+    settings = make_settings(max_tool_result_chars=20)
+    content = "x" * 100
+    tree = RepoTree(entries=[TreeEntry(path="min.js", type="blob", size=100)], truncated=False)
+    rt = make_repo_tools(monkeypatch, tree=tree, settings=settings, file_contents={"min.js": content})
+
+    result = rt.read_file("min.js")
+
+    assert "<file_content>" in result
+    assert "truncated" in result.lower()
+    assert rt.shown_lines("min.js") == frozenset()
 
 
 def test_read_file_truncates_to_max_tool_result_chars(monkeypatch):
@@ -350,7 +520,32 @@ def test_tool_schemas_declare_expected_names_and_params():
     assert READ_FILE_SCHEMA["function"]["parameters"]["required"] == ["path"]
     assert GET_DEPENDENCIES_SCHEMA["function"]["parameters"]["required"] == []
     assert SEARCH_CODE_SCHEMA["function"]["parameters"]["required"] == ["query"]
-    assert TOOLS == [LIST_DIRECTORY_SCHEMA, READ_FILE_SCHEMA, GET_DEPENDENCIES_SCHEMA, SEARCH_CODE_SCHEMA]
+    assert TOOLS == [
+        LIST_DIRECTORY_SCHEMA,
+        READ_FILE_SCHEMA,
+        GET_DEPENDENCIES_SCHEMA,
+        SEARCH_CODE_SCHEMA,
+        REPORT_FINDING_SCHEMA,
+    ]
+
+
+def test_report_finding_schema_matches_the_validator():
+    from app.agent.findings import FIELDS, ISSUE_TYPES, REQUIRED_FIELDS, SEVERITIES, V1_CATEGORIES
+
+    fn = REPORT_FINDING_SCHEMA["function"]
+    props = fn["parameters"]["properties"]
+    assert fn["name"] == "report_finding"
+    assert sorted(fn["parameters"]["required"]) == sorted(REQUIRED_FIELDS)
+    assert "confidence" not in fn["parameters"]["required"]  # optional, defaults to 0.5
+    assert "suggestion" not in fn["parameters"]["required"]  # optional, default message
+    assert set(props) == set(FIELDS)
+    assert props["severity"]["enum"] == list(SEVERITIES)
+    # The schema only offers what v1 accepts, so the model isn't tempted
+    # into categories/issue types the validator would reject.
+    assert props["category"]["enum"] == list(V1_CATEGORIES)
+    assert props["issue_type"]["enum"] == list(ISSUE_TYPES)
+    assert props["line_start"]["type"] == "integer"
+    assert props["confidence"]["type"] == "number"
 
 
 def make_fake_clock(*values):
@@ -687,3 +882,456 @@ def test_search_code_still_stops_early_when_out_of_time_despite_concurrency(monk
     result = rt.search_code("anything")
 
     assert "ran out of time" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# report_finding: read-gating, verification, dedup, cap
+# ---------------------------------------------------------------------------
+
+from app.agent.findings import MAX_FINDINGS, Finding  # noqa: E402
+
+DB_PY = "\n".join(
+    [
+        "import sqlite3",  # 1
+        "",  # 2
+        "def get(cur, uid):",  # 3
+        '    cur.execute(f"SELECT * FROM users WHERE id = {uid}")',  # 4
+        "",  # 5
+        "",  # 6
+        "",  # 7
+        "",  # 8
+        "def ok(cur, uid):",  # 9
+        '    cur.execute("SELECT * FROM users WHERE id = ?", (uid,))',  # 10
+    ]
+)
+DB_TREE = RepoTree(
+    entries=[
+        TreeEntry(path="db.py", type="blob", size=len(DB_PY)),
+        TreeEntry(path="src", type="tree"),
+    ],
+    truncated=False,
+)
+
+
+def finding_args(**overrides) -> dict:
+    args = dict(
+        severity="high",
+        category="security",
+        issue_type="sql_injection",
+        file="db.py",
+        line_start=4,
+        line_end=4,
+        description="uid is formatted into the query.",
+        suggestion="Use a ? placeholder.",
+        confidence=0.9,
+    )
+    args.update(overrides)
+    return args
+
+
+def make_db_tools(monkeypatch) -> RepoTools:
+    return make_repo_tools(monkeypatch, tree=DB_TREE, file_contents={"db.py": DB_PY})
+
+
+def test_report_finding_records_a_verified_finding(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py")
+
+    result = rt.report_finding(finding_args())
+
+    assert result.startswith("Recorded finding #1")
+    assert "verified" in result.lower()
+    assert len(rt.findings) == 1
+    assert rt.findings[0].verified is True
+    assert rt.findings[0].file == "db.py"
+    assert "line 4" in rt.findings[0].verification_note
+
+
+def test_report_finding_flags_a_finding_whose_evidence_does_not_match(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py")
+
+    result = rt.report_finding(finding_args(line_start=10, line_end=10))
+
+    assert "UNVERIFIED" in result
+    assert "report_finding again" in result
+    assert len(rt.findings) == 1
+    assert rt.findings[0].verified is False
+    assert rt.findings[0].verification_note
+
+
+def test_report_finding_returns_all_validation_errors_and_records_nothing(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py")
+
+    result = rt.report_finding(finding_args(severity="critical", confidence=7))
+
+    assert result.startswith("Error: report_finding rejected, nothing was recorded")
+    assert "- severity:" in result
+    assert "- confidence:" in result
+    assert rt.findings == []
+
+
+def test_report_finding_rejects_a_file_that_was_never_read(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+
+    result = rt.report_finding(finding_args())
+
+    assert result.startswith("Error: report_finding rejected")
+    assert "not seen" in result
+    assert "read_file('db.py', start=4, end=4)" in result
+    assert rt.findings == []
+
+
+def test_a_search_that_did_not_show_the_cited_line_does_not_count(monkeypatch):
+    # M2b decision: search lines shown in full count as seen -- but only
+    # those lines, not the whole file the search touched.
+    rt = make_db_tools(monkeypatch)
+    rt.search_code("import")  # shows line 1 only
+
+    result = rt.report_finding(finding_args())  # cites line 4
+
+    assert result.startswith("Error")
+    assert rt.findings == []
+
+
+def test_report_finding_rejects_lines_outside_what_was_shown(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py", start=1, end=3)
+
+    result = rt.report_finding(finding_args(line_start=4, line_end=4))
+
+    assert result.startswith("Error")
+    assert "1-3" in result
+    assert "read_file('db.py', start=4, end=4)" in result
+    assert rt.findings == []
+
+
+def test_report_finding_rejects_a_missing_file(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+
+    result = rt.report_finding(finding_args(file="nope.py"))
+
+    assert result.startswith("Error")
+    assert "not found" in result
+
+
+def test_report_finding_rejects_a_directory(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+
+    result = rt.report_finding(finding_args(file="src"))
+
+    assert result.startswith("Error")
+    assert "directory" in result
+
+
+def test_report_finding_rejects_lines_past_the_end_of_the_file(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py")
+
+    result = rt.report_finding(finding_args(line_start=9, line_end=14))
+
+    assert result.startswith("Error")
+    assert "10 lines" in result
+
+
+def test_report_finding_normalizes_the_file_path(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py")
+
+    result = rt.report_finding(finding_args(file="./db.py"))
+
+    assert result.startswith("Recorded")
+    assert rt.findings[0].file == "db.py"
+
+
+def test_report_finding_does_not_record_a_duplicate_of_a_verified_finding(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py")
+    rt.report_finding(finding_args(line_start=3, line_end=4))
+
+    result = rt.report_finding(finding_args(line_start=4, line_end=5))
+
+    assert "already recorded" in result.lower()
+    assert len(rt.findings) == 1
+
+
+def test_report_finding_different_issue_type_on_same_lines_is_not_a_duplicate(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py")
+    rt.report_finding(finding_args())
+
+    rt.report_finding(finding_args(issue_type="hardcoded_secret"))
+
+    assert len(rt.findings) == 2
+
+
+def test_report_finding_corrected_report_replaces_an_overlapping_unverified_one(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py")
+    # First attempt cites line 1 (window 1-3: no SQL) -> flagged.
+    rt.report_finding(finding_args(line_start=1, line_end=1))
+    assert rt.findings[0].verified is False
+
+    # Corrected attempt overlaps it and verifies -> replaces it.
+    result = rt.report_finding(finding_args(line_start=1, line_end=4))
+
+    assert result.startswith("Recorded")
+    assert len(rt.findings) == 1
+    assert rt.findings[0].verified is True
+    assert (rt.findings[0].line_start, rt.findings[0].line_end) == (1, 4)
+
+
+def test_report_finding_enforces_the_per_scan_cap(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py")
+    # Seeded directly (distinct files, so no dedup): the cap is what's under test.
+    for i in range(MAX_FINDINGS):
+        rt._findings.append(
+            Finding(
+                severity="low", category="security", issue_type="sql_injection", file=f"f{i}.py",
+                line_start=1, line_end=1, description="d", suggestion="s", confidence=0.5,
+            )
+        )
+
+    result = rt.report_finding(finding_args())
+
+    assert result.startswith("Error")
+    assert str(MAX_FINDINGS) in result
+    assert len(rt.findings) == MAX_FINDINGS
+
+
+def test_findings_property_returns_a_copy(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py")
+    rt.report_finding(finding_args())
+
+    rt.findings.clear()
+
+    assert len(rt.findings) == 1
+
+
+def test_report_finding_never_raises(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(tools, "check_evidence", boom)
+
+    result = rt.report_finding(finding_args())
+
+    assert result.startswith("Error")
+    assert "kaboom" in result
+
+
+def test_report_finding_rejects_non_dict_arguments(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+
+    result = rt.report_finding("severity=high")  # type: ignore[arg-type]
+
+    assert result.startswith("Error: report_finding rejected")
+
+
+def test_forget_shown_allows_a_re_read_and_requires_it_before_reporting(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py")
+
+    rt.forget_shown("./db.py")
+
+    assert rt.shown_lines("db.py") == frozenset()
+    assert rt.report_finding(finding_args()).startswith("Error")
+    assert "<file_content>" in rt.read_file("db.py")  # not "already read"
+    assert rt.report_finding(finding_args()).startswith("Recorded")
+
+
+def test_forget_shown_on_an_unread_path_is_harmless(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+
+    rt.forget_shown("never-read.py")
+
+    assert rt.shown_lines("never-read.py") == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# search_code lines shown in full count as seen (tracked separately)
+# ---------------------------------------------------------------------------
+
+
+def test_search_matches_shown_in_full_are_tracked_separately_from_read_lines(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+
+    rt.search_code("SELECT")
+
+    assert rt.search_seen_lines("db.py") == frozenset({4, 10})
+    assert rt.shown_lines("db.py") == frozenset()  # read_file's record is untouched
+
+
+def test_report_finding_accepts_lines_seen_only_in_search_results(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.search_code("SELECT")
+
+    result = rt.report_finding(finding_args(line_start=4, line_end=4))
+
+    assert result.startswith("Recorded finding #1 (verified")
+
+
+def test_report_finding_still_rejects_lines_not_shown_by_search_or_read(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.search_code("SELECT")
+
+    result = rt.report_finding(finding_args(line_start=3, line_end=4))  # line 3 was never shown
+
+    assert result.startswith("Error")
+    assert "3-4" in result
+
+
+def test_search_and_read_lines_combine_to_cover_a_range(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.search_code("SELECT")  # shows line 4
+    rt.read_file("db.py", start=3, end=3)
+
+    result = rt.report_finding(finding_args(line_start=3, line_end=4))
+
+    assert result.startswith("Recorded")
+
+
+def test_truncated_search_snippets_do_not_count_as_seen(monkeypatch):
+    long_line = "x = '" + "a" * 300 + "'  # SELECT"
+    tree = RepoTree(entries=[TreeEntry(path="app.py", type="blob", size=len(long_line))], truncated=False)
+    rt = make_repo_tools(monkeypatch, tree=tree, file_contents={"app.py": long_line})
+
+    rt.search_code("SELECT")
+
+    assert rt.search_seen_lines("app.py") == frozenset()
+
+
+def test_forget_search_lines_clears_all_search_seen_lines(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.search_code("SELECT")
+
+    rt.forget_search_lines()
+
+    assert rt.search_seen_lines("db.py") == frozenset()
+    assert rt.report_finding(finding_args()).startswith("Error")
+
+
+def test_unseen_file_error_mentions_search_too(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+
+    result = rt.report_finding(finding_args())
+
+    assert "not seen" in result
+    assert "read_file('db.py', start=4, end=4)" in result
+
+
+# ---------------------------------------------------------------------------
+# finding source
+# ---------------------------------------------------------------------------
+
+
+def test_report_finding_records_where_the_finding_came_from(monkeypatch):
+    rt = make_db_tools(monkeypatch)
+    rt.read_file("db.py")
+
+    rt.report_finding(finding_args())
+    rt.report_finding(finding_args(issue_type="hardcoded_secret", line_start=1, line_end=1), source="parsed_text")
+
+    assert [f.source for f in rt.findings] == ["tool_call", "parsed_text"]
+    assert rt.findings[0].to_dict()["source"] == "tool_call"
+
+
+# ---------------------------------------------------------------------------
+# candidate_search: fixed searches run by the loop (approach 3)
+# ---------------------------------------------------------------------------
+
+CANDIDATE_TREE = RepoTree(
+    entries=[
+        TreeEntry(path="config.py", type="blob", size=100),
+        TreeEntry(path="db.py", type="blob", size=100),
+    ],
+    truncated=False,
+)
+CONFIG_PY = "\n".join(
+    [
+        "import os",  # 1
+        'API_KEY = "9f2c4e8a1b7d3f6e"',  # 2
+        "KEY_A = 1",  # 3
+        "KEY_B = 2",  # 4
+        "KEY_C = 3",  # 5
+        "KEY_D = 4",  # 6
+        'DB_PASSWORD = "Tr0ub4dor&3-prod"',  # 7
+    ]
+)
+
+
+def make_candidate_tools(monkeypatch) -> RepoTools:
+    return make_repo_tools(monkeypatch, tree=CANDIDATE_TREE, file_contents={"config.py": CONFIG_PY, "db.py": DB_PY})
+
+
+def test_candidate_search_returns_matching_lines_from_several_terms(monkeypatch):
+    rt = make_candidate_tools(monkeypatch)
+
+    result = rt.candidate_search(("password", "SELECT"))
+
+    assert result.startswith("<file_content>") and result.endswith("</file_content>")
+    assert 'config.py:7: DB_PASSWORD = "Tr0ub4dor&3-prod"' in result
+    assert "db.py:4:" in result
+
+
+def test_candidate_search_round_robins_so_one_noisy_term_cannot_crowd_out_others(monkeypatch):
+    rt = make_candidate_tools(monkeypatch)
+
+    # "key" matches 5 lines; with max_lines=3 and per_term=2, password still gets in.
+    result = rt.candidate_search(("key", "password"), per_term=2, max_lines=3)
+
+    assert "config.py:7:" in result
+    assert result.count("\n") - 1 == 3  # exactly 3 lines between the delimiters
+
+
+def test_candidate_search_dedupes_lines_matched_by_several_terms(monkeypatch):
+    rt = make_candidate_tools(monkeypatch)
+
+    result = rt.candidate_search(("api_key", "API"))
+
+    assert result.count("config.py:2:") == 1
+
+
+def test_candidate_search_marks_only_the_lines_it_shows_as_seen(monkeypatch):
+    rt = make_candidate_tools(monkeypatch)
+
+    rt.candidate_search(("key",), per_term=1, max_lines=1)
+
+    assert rt.search_seen_lines("config.py") == frozenset({2})
+
+
+def test_candidate_search_lines_count_as_evidence_for_report_finding(monkeypatch):
+    rt = make_candidate_tools(monkeypatch)
+    rt.candidate_search(("SELECT",))
+
+    result = rt.report_finding(finding_args())  # db.py line 4, never read_file'd
+
+    assert result.startswith("Recorded finding #1 (verified")
+
+
+def test_candidate_search_returns_empty_string_when_nothing_matches(monkeypatch):
+    rt = make_candidate_tools(monkeypatch)
+
+    assert rt.candidate_search(("no-such-term",)) == ""
+
+
+def test_candidate_search_never_raises(monkeypatch):
+    rt = make_candidate_tools(monkeypatch)
+
+    def boom(*args, **kwargs):
+        raise GitHubError("rate limited")
+
+    monkeypatch.setattr(tools.github_client, "list_tree", boom)
+
+    assert rt.candidate_search(("password",)) == ""
+
+
+def test_default_candidate_terms_cover_both_issue_types():
+    assert {"password", "secret", "token", "key"} <= set(tools.CANDIDATE_TERMS)
+    assert {"SELECT", "execute("} <= set(tools.CANDIDATE_TERMS)

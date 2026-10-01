@@ -1,10 +1,12 @@
 """Tool-calling smoke test for local Ollama models.
 
-M1 version: a single-tool sanity check. M2a version (this one): compares
-tool-*selection* accuracy between two tool-set sizes -- 2 tools
-(list_directory, read_file) vs all 4 (+ get_dependencies, search_code) --
-on the same scenarios, to check whether adding tools makes the model worse
-at picking the right one. Uses the real tool schemas from app.agent.tools,
+M1 version: a single-tool sanity check. M2a version: 2 vs 4 tools.
+M2b version (this one): compares tool-*selection* accuracy between 4 tools
+(list_directory, read_file, get_dependencies, search_code) and all 5
+(+ report_finding) on the same scenarios, to check whether adding the
+largest schema makes the model worse at picking the right tool -- plus a
+report_finding scenario that checks whether the model's finding passes the
+backend's real validator (app.agent.findings.validate_finding_args). Uses the real tool schemas from app.agent.tools,
 not hand-rolled ones, so this measures what the agent loop actually sends.
 
 Uses the LLM provider abstraction (app.llm.OllamaProvider) for the actual
@@ -32,11 +34,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 NOTES_PATH = REPO_ROOT / "docs" / "NOTES.md"
 
 sys.path.insert(0, str(REPO_ROOT / "backend"))
+from app.agent.findings import validate_finding_args  # noqa: E402
 from app.agent.tools import (  # noqa: E402
     GET_DEPENDENCIES_SCHEMA,
     LIST_DIRECTORY_SCHEMA,
     READ_FILE_SCHEMA,
     SEARCH_CODE_SCHEMA,
+    TOOLS,
 )
 from app.config import get_settings  # noqa: E402
 from app.llm import DEFAULT_TEMPERATURE, OllamaProvider  # noqa: E402
@@ -53,8 +57,8 @@ SYSTEM_PROMPT = (
 )
 
 TOOL_SETS = {
-    "2-tool": [LIST_DIRECTORY_SCHEMA, READ_FILE_SCHEMA],
     "4-tool": [LIST_DIRECTORY_SCHEMA, READ_FILE_SCHEMA, GET_DEPENDENCIES_SCHEMA, SEARCH_CODE_SCHEMA],
+    "5-tool": TOOLS,
 }
 
 
@@ -91,37 +95,66 @@ def _expect_any_args(args: dict) -> bool:
     return True  # get_dependencies takes no meaningful args
 
 
-# Two scenarios carried over from M1 (list_directory, meaningful with either
-# tool-set size) plus two new ones (only meaningful with all 4 tools
-# available, since the "correct" tool doesn't exist in the 2-tool set).
+def _expect_valid_finding(args: dict) -> bool:
+    """Passes the backend's real validator, and points at the right issue."""
+    finding, errors = validate_finding_args(args)
+    return (
+        not errors
+        and finding.issue_type == "sql_injection"
+        and finding.file == "db.py"
+        and finding.line_start <= 24 <= finding.line_end
+    )
+
+
+REPORT_FINDING_PROMPT = (
+    "You already read db.py with read_file. It contained:\n"
+    "<file_content>\n"
+    "22:     conn = get_connection()\n"
+    "23:     cur = conn.cursor()\n"
+    "24:     query = f\"SELECT id, title FROM notes WHERE owner = '{owner}'\"\n"
+    "25:     cur.execute(query)\n"
+    "</file_content>\n"
+    "Record this SQL injection as a finding."
+)
+
+
+# The four M2a scenarios run under both tool-set sizes (the accuracy
+# comparison); report-finding only makes sense with all 5 tools.
 SCENARIOS = [
     {
         "name": "short-path",
         "prompt": "What files are in the src folder?",
         "expected_tool": "list_directory",
         "check_args": _expect_list_directory_path("src"),
-        "tool_sets": ["2-tool", "4-tool"],
+        "tool_sets": ["4-tool", "5-tool"],
     },
     {
         "name": "nested-path",
         "prompt": "Show me what is inside backend/app/agent.",
         "expected_tool": "list_directory",
         "check_args": _expect_list_directory_path("backend/app/agent"),
-        "tool_sets": ["2-tool", "4-tool"],
+        "tool_sets": ["4-tool", "5-tool"],
     },
     {
         "name": "dependencies",
         "prompt": "What are this project's dependencies?",
         "expected_tool": "get_dependencies",
         "check_args": _expect_any_args,
-        "tool_sets": ["4-tool"],
+        "tool_sets": ["4-tool", "5-tool"],
     },
     {
         "name": "search-term",
         "prompt": "Find every place in the code that mentions the word 'password'.",
         "expected_tool": "search_code",
         "check_args": _expect_query_containing("password"),
-        "tool_sets": ["4-tool"],
+        "tool_sets": ["4-tool", "5-tool"],
+    },
+    {
+        "name": "report-finding",
+        "prompt": REPORT_FINDING_PROMPT,
+        "expected_tool": "report_finding",
+        "check_args": _expect_valid_finding,
+        "tool_sets": ["5-tool"],
     },
 ]
 
@@ -198,7 +231,7 @@ def run_model(base_url: str, model: str, attempts: int) -> list[dict]:
     print(f"\n### {model} ###")
     print("warm-up call (not counted)...")
     warmup = SCENARIOS[0]
-    one_attempt(provider, warmup["prompt"], warmup["expected_tool"], warmup["check_args"], TOOL_SETS["2-tool"])
+    one_attempt(provider, warmup["prompt"], warmup["expected_tool"], warmup["check_args"], TOOL_SETS["4-tool"])
 
     rows = []
     for scenario in SCENARIOS:
@@ -209,13 +242,13 @@ def run_model(base_url: str, model: str, attempts: int) -> list[dict]:
 
 def render_markdown(rows: list[dict], ollama_version: str, skipped: list[str], attempts: int) -> str:
     lines = [
-        f"## Tool-set-size smoke test (M2a) — {date.today().isoformat()}",
+        f"## Tool-set-size smoke test (M2b) — {date.today().isoformat()}",
         "",
         f"Ollama {ollama_version}, temperature {DEFAULT_TEMPERATURE}, {attempts} attempts per "
         "(scenario, tool-set) combination, one warm-up call excluded from timings. Tool schemas "
-        "are the real ones from app.agent.tools, not hand-rolled. `short-path`/`nested-path` run "
-        "under both tool-set sizes (the accuracy comparison); `dependencies`/`search-term` only "
-        "make sense with all 4 tools available.",
+        "are the real ones from app.agent.tools, not hand-rolled. The four M2a scenarios run under "
+        "both tool-set sizes (the accuracy comparison); `report-finding` only makes sense with all 5 "
+        "tools, and counts as Args OK only if the finding passes the backend's real validator.",
         "",
         "| Model | Tool set | Scenario | Tool called | Valid JSON | Args OK | Avg s | Median s |",
         "|---|---|---|---|---|---|---|---|",
