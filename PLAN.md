@@ -110,6 +110,7 @@ An agentic AI tool that explores a public GitHub repository on its own and produ
 {
   "severity": "high | medium | low | info",
   "category": "security | bug | performance | maintainability",
+  "issue_type": "hardcoded_secret | sql_injection",
   "file": "src/auth.py",
   "line_start": 42,
   "line_end": 55,
@@ -119,9 +120,11 @@ An agentic AI tool that explores a public GitHub repository on its own and produ
 }
 ```
 
+`issue_type` names the specific v1 issue kind (v1 scope is only these two, both under `category: "security"`). The backend needs it to choose the right evidence check, and the M5 evaluation needs it to match a finding to a planted bug. New issue types get added here as the scope widens in v2.
+
 **Final report:** repo summary, short architecture overview, findings sorted by severity, and run statistics (steps, tokens, cost, duration).
 
-**Verification:** after the agent reports a finding, the backend checks that the referenced file and line range actually exist. Findings that fail this check are flagged or dropped.
+**Verification:** after the agent reports a finding, the backend checks that the referenced file and line range actually exist, and that the agent has read those lines with `read_file`; failures are rejected with a readable error so the model can retry. Then a deterministic evidence check looks at the cited lines (±2): a credential-like literal for `hardcoded_secret`, or SQL built with string formatting/concatenation for `sql_injection`. Findings that fail the evidence check are kept but flagged `verified: false`, not silently accepted.
 
 ---
 
@@ -176,10 +179,10 @@ repository-scouter/
 - [x] **Done when:** `python scan.py <url>` produces a sensible architecture explanation
 
 ### M2 — Structured findings (2–3 days)
-- [ ] Add `search_code`, `get_dependencies`, `report_finding`
-- [ ] Output validation and tool error handling
-- [ ] Guardrails: read-file tracking, token limit, timeouts
-- [ ] **Done when:** scans produce consistent JSON findings on 3 different repos
+- [x] Add `search_code`, `get_dependencies`, `report_finding`
+- [x] Output validation and tool error handling
+- [x] Guardrails: read-file tracking, token limit, timeouts
+- [x] **Done when:** scans produce consistent JSON findings on 3 different repos *(final round: 5 of 8 planted bugs verified, 1 verified false positive of 6, all verified findings via the forced JSON step or parsed text, none via a real `report_finding` tool call; see docs/NOTES.md)*
 
 ### M3 — API and streaming (1–2 days)
 - [ ] FastAPI endpoints with SSE

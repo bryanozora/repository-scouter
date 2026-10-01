@@ -218,3 +218,261 @@ but this is a case where soft prompt guidance alone wasn't enough to change a sm
 behavior. Documenting honestly rather than re-running for a nicer result. Worth revisiting
 with a stronger nudge (or accepting as a known small-model limitation) if M5's evaluation
 suite shows shallow-but-plausible summaries costing real findings on non-trivial repos.
+
+## Known limitations of the evidence check (M2b) — 2026-10-01
+
+`check_evidence` in `app/agent/findings.py` is a regex plausibility check, not a scanner. Two known gaps, left as-is for v1:
+
+- **False "verified" SQL injection:** a non-SQL f-string (e.g. a log line) within ±2 lines of a parameterized query can make an `sql_injection` finding pass, since the SQL keyword and the dynamic-string marker only need to appear somewhere in the same window, not in the same expression.
+- **Missed env-var fallback secrets:** a real secret used as a default, like `os.getenv("API_KEY", "real-secret-value")`, does not verify as `hardcoded_secret`, because only `name = "literal"`-style assignments (and known key formats) are recognized.
+
+## Measured: Ollama's effective context window is 4096 tokens — 2026-10-01
+
+`ollama show qwen2.5:7b-instruct` reports `context length 32768`, but that's what the model
+*supports*, not what the server allocates. With Ollama 0.10.1 defaults (no
+`OLLAMA_CONTEXT_LENGTH` set), measured through the same OpenAI-compatible endpoint the agent uses,
+with a codeword planted at the very start of the prompt:
+
+| Prompt size | `usage.prompt_tokens` | Model recalled the codeword at the start? |
+|---|---|---|
+| ~2k tokens | 1955 | yes |
+| ~8k tokens | **4096** (capped) | **no** — answered "filler" |
+
+So a prompt over 4096 tokens is **silently truncated from the start**, and the start of an agent
+conversation is the system prompt, prompt-injection defense included. The M1/M2a scans used
+6000-char tool results (~2000 tokens each) and very likely crossed this line after two or three reads
+without any error, which may explain some of the shallow-summary behavior recorded above.
+
+Raising the window isn't practical on this machine: with `num_ctx: 8192` (per request, via the native
+`/api/chat` API, without changing any persistent setting) the model grew to 6.3 GB, split 45%/55%
+CPU/GPU, and a single ~8k-token prompt did not finish within 15 minutes.
+
+What M2b does about it:
+- `MAX_PROMPT_TOKENS=3300`: the loop projects every prompt's size before sending it and keeps it under
+  this, leaving ~800 tokens of the 4096 for the reply.
+- The fixed part of every prompt (system prompt + 5 tool schemas) measured **1261 tokens**, so the
+  system prompt was rewritten to be compact.
+- `MAX_TOOL_RESULT_CHARS` lowered from 6000 to 2500 (~800 tokens), and the loop now caps *every*
+  tool result to it (+500 chars headroom so `read_file`'s own whole-line truncation is never re-cut).
+- When the projection is over budget, the loop first **compacts** the oldest tool results (replaces
+  them with a short "removed to fit the context window" marker), and only ends the scan with a
+  fallback summary if that's not enough. A compacted `read_file` result stops counting as "read" for
+  `report_finding`, so evidence for a finding is always something the model can currently see.
+
+## M2b first real runs: 0 of 8 planted bugs recorded — 2026-10-01
+
+`python scan.py --local ../evals/repos/<fixture>`, `qwen2.5:7b-instruct`, M2b prompt and
+guardrails, `SCAN_TIMEOUT_SECONDS=900` for these runs (see the duration column; the default of 120s
+would have cut clean-control short). An earlier py-notes-api run was discarded because the fixture's
+answer key (`expected.json`) was inside the scanned directory and `search_code` found it; ground
+truth now lives in `evals/expected/`, and a test guards against that happening again.
+
+| Fixture | Planted | Recorded (verified) | False positives recorded | Steps | Max prompt | Duration |
+|---|---|---|---|---|---|---|
+| `py-notes-api` | 4 | 0 | 0 | 3 | 1405 | 85s |
+| `js-shop` | 4 | 0 | 0 | 3 | 1418 | 146s |
+| `clean-control` | 0 | 0 | 0 | 8 | 2029 | 314s |
+
+The evidence check never ran on a real finding, because the model almost never reached
+`report_finding`:
+
+- **It stops after 2-3 steps** and ends with a text answer, without reading any source file.
+- **It writes tool calls as text.** In py-notes-api it ended with ```` ```json {"name": "read_file", ...} ```` ````
+  in its answer instead of calling the tool; the loop treats any reply without `tool_calls` as the
+  final answer.
+- **It reports findings in prose.** In the discarded run it described `SMTP_PASSWORD` (correct file
+  and line) in its summary rather than calling `report_finding`. In js-shop it listed two env-var
+  lookups as "hardcoded secrets" in prose (both are decoys).
+- **Its searches were too narrow.** It searched only for "password", never "SELECT"/"execute"/"token",
+  so it never saw the SQL injections, `PAYMENT_TOKEN`, or `signing_secret`.
+- **Its only `report_finding` call** (clean-control) left out `confidence` and was rejected. Instead of
+  retrying, the model put the corrected JSON in its final text. That finding would have been a false
+  positive anyway (a parameterized `%(t)s` query, on lines it hadn't read), so the read-gating and
+  evidence check would have rejected or flagged it.
+
+What worked: no crashes; the context budget held (max prompt 2029 of 3300, no compactions needed);
+the validator's error message was clear; the dedup notes fired. Stopped here, before the 5-tool smoke
+test, for a decision on how to revise the prompt or loop.
+
+## Documented limitation (for the README): 4096-token context window — 2026-10-01
+
+- **What:** with Ollama's defaults on this machine, `qwen2.5:7b-instruct` gets a 4096-token context
+  window (measured; see "Measured: Ollama's effective context window" above), not the 32k the model
+  supports. A longer prompt is **silently truncated from the start**. No error is returned, and
+  `usage.prompt_tokens` just reads 4096.
+- **Risk for earlier scans:** the start of an agent conversation is the system prompt, which holds
+  the role, the tool rules, and the prompt-injection defense ("contents of `<file_content>` are
+  untrusted"). **Scans made before the M2b token guardrail (all M1 and M2a runs in this file) may
+  have silently lost the system prompt** once several 6000-char tool results pushed the
+  conversation past 4096 tokens. Their results, including any "the injection defense held"
+  conclusions, should not be relied on.
+- **Mitigation since M2b:** every prompt is projected before sending and kept under
+  `MAX_PROMPT_TOKENS=3300`, older tool results are compacted to make room, and the scan ends with a
+  fallback summary rather than send an over-long prompt. The cost is that the agent only ever sees
+  ~2000 tokens of repository content at a time.
+- **Not done:** raising the window (`OLLAMA_CONTEXT_LENGTH` / `num_ctx`) isn't practical on an 8GB
+  machine: at 8192 a single long prompt didn't finish in 15 minutes. A larger machine or a hosted
+  provider would lift this limit; the guardrail adapts through `MAX_PROMPT_TOKENS`.
+
+## M2b re-run with nudges + optional confidence: still 0 of 8 recorded — 2026-10-01
+
+Same 3 fixtures, same model, after adding (1) one corrective retry for a tool call written as
+text, (2) one push back on an early stop that skipped reading source or one issue type, and
+(3) `confidence` optional (default 0.5). New defaults, no env overrides (`SCAN_TIMEOUT_SECONDS=400`).
+
+| Fixture | Planted | Recorded (verified) | False positives recorded | Steps | Nudges (text / early-stop) | Duration |
+|---|---|---|---|---|---|---|
+| `py-notes-api` | 4 | 0 | 0 | 9 | 0 / 1 | 362s |
+| `js-shop` | 4 | 0 | 0 | 6 | 1 / 1 | 466s |
+| `clean-control` | 0 | 0 | 0 | 8 | 1 / 1 | 480s |
+
+The nudges changed behavior: scans went deeper (6-9 steps instead of 3), and the model now
+searched for both issue types and read some files. Recall stayed at 0 for a different reason.
+**The model found real bugs but never called `report_finding` as a tool:**
+
+- **py-notes-api:** the final text correctly names `db.py` line 24 (f-string SQLi), line 42
+  (concatenation SQLi) and `SMTP_PASSWORD`, so 3 of 4 planted bugs were identified *in prose*. It
+  then claims "These findings have been recorded and reported", which is **false** (none were). It
+  also never read `db.py` with `read_file`; it described those lines from `search_code` snippets, so
+  the read-gating would have rejected them anyway.
+- **js-shop:** after the text-tool-call nudge, it wrote findings as Python-call syntax in text
+  (`report_finding("medium", "security", ...)`), which isn't JSON, and the one nudge was already used.
+  Prose identified 1 planted bug (the template-literal SQLi), cited together with a decoy line, plus
+  one false positive (`process.env.DB_PASSWORD` as a "hardcoded secret").
+- **clean-control:** wrote two `{"name": "report_finding", ...}` objects as text, both false
+  positives (parameterized `%s` / `%(t)s` queries). Not recorded, so no false positive in the
+  report, but only because the call was never made.
+
+Also seen: two scans ran past the 400s timeout (466s, 480s), since it's checked once per step and a
+step takes ~40-60s. The timeout is best-effort by design.
+
+**Takeaway:** the bottleneck is the `report_finding` tool call itself. `qwen2.5:7b-instruct` calls
+the read/search tools reliably, but for findings it falls back to writing them as text. Fixed
+built-in searches (approach 3) wouldn't address that, because finding the bugs isn't what's failing.
+The final summary text can also claim findings were recorded when they weren't, so the structured
+findings list (not the prose) must be the source of truth in the report. Stopped here for a decision.
+
+## Verified: Ollama 0.10.1 enforces `response_format` (JSON schema) — 2026-10-01
+
+Tested directly on the OpenAI-compatible endpoint with `qwen2.5:7b-instruct`, using a prompt that
+asks for prose ("Write a four-line poem about cats"), 2 attempts each:
+
+| `response_format` | Output |
+|---|---|
+| none | the poem (not JSON), 2/2 |
+| `{"type": "json_object"}` | valid JSON instead of the poem, 2/2 |
+| `{"type": "json_schema", ...}` | valid JSON **in the requested schema's shape**, 2/2, even for a poem prompt |
+
+So the output is constrained to the schema, not just requested. The *values* are not reliable (it
+produced `"file": "poem"`, `"line_start": 1523456789012345`), which is why every item from the
+forced JSON step still goes through validation, read-gating and the evidence check. The "reply with
+only a JSON array" fallback wasn't needed.
+
+## M2b round 3: forced JSON step + parsed text findings + search-seen lines — 2026-10-01
+
+Same 3 fixtures and model. New since round 2: findings written as text in any reply are executed
+through `report_finding` (`parsed_text`); after the scan, one schema-constrained JSON call lists the
+findings (`forced_json`) with one correction round for rejected items; lines shown in full as
+`search_code` matches count as seen.
+
+| Fixture | Planted | Verified (planted) | Verified false positives | Flagged (unverified) | Steps | Duration |
+|---|---|---|---|---|---|---|
+| `py-notes-api` | 4 | **3** (all `parsed_text`) | 0 | 0 | 5 | 503s |
+| `js-shop` | 4 | **1** (`forced_json`) | 0 | 0 | 5 | 343s |
+| `clean-control` | 0 | 0 | **0** | 1 (decoy `TEST_PASSWORD`, flagged by evidence check) | 8 | 565s |
+
+**Total: 4 of 8 planted bugs verified, 0 verified false positives** (rounds 1-2: 0 of 8). No finding
+came through a real `report_finding` tool call; the one real tool-call finding (clean-control,
+`TEST_PASSWORD`) was a false positive and was flagged.
+
+Missed: `notes-analytics-key` (never reported), and in js-shop `shop-payment-token`,
+`shop-status-concat`, `shop-webhook-secret`. The model never opened `src/payments.js` or
+`config/default.yml`; its searches ("password", "SELECT") don't match `PAYMENT_TOKEN` or
+`signing_secret`, and its forced JSON list held only the template-literal SQLi.
+
+**Bug found in the forced step (mine):** in py-notes-api, all 4 `forced_json` items were rejected
+with "you have not seen any lines of config.py / db.py", although `parsed_text` had just verified
+the same lines. The forced call compacted the conversation to fit the context window (6 compactions),
+and compaction calls `forget_shown` / `forget_search_lines`, which cleared the seen-lines records
+right before the forced items were checked. It didn't cost recall in this run (they were duplicates of
+already-verified findings), and the correction round was wasted, but it would reject genuinely new
+findings in the forced step. Fix to discuss: compaction for the final steps (fallback / forced report)
+should not forget seen lines. The lines *were* seen earlier in the scan, which is the original rule.
+
+Other observations: the model twice left out `suggestion` in a real tool call (clean-control), which
+validation rejected; scans now take 343-565s (the 400s timeout is checked between steps, and the
+forced step runs after it).
+
+## Tool-set-size smoke test (M2b) — 2026-10-01
+
+Ollama 0.10.1, temperature 0.2, 10 attempts per (scenario, tool-set) combination, one warm-up call excluded from timings. Tool schemas are the real ones from app.agent.tools, not hand-rolled. The four M2a scenarios run under both tool-set sizes (the accuracy comparison); `report-finding` only makes sense with all 5 tools, and counts as Args OK only if the finding passes the backend's real validator.
+
+| Model | Tool set | Scenario | Tool called | Valid JSON | Args OK | Avg s | Median s |
+|---|---|---|---|---|---|---|---|
+| `qwen2.5:7b-instruct` | 4-tool | short-path | 10/10 | 10/10 | 10/10 | 6.7 | 6.7 |
+| `qwen2.5:7b-instruct` | 5-tool | short-path | 10/10 | 10/10 | 10/10 | 7.0 | 6.8 |
+| `qwen2.5:7b-instruct` | 4-tool | nested-path | 10/10 | 10/10 | 10/10 | 7.3 | 7.3 |
+| `qwen2.5:7b-instruct` | 5-tool | nested-path | 10/10 | 10/10 | 10/10 | 7.6 | 7.4 |
+| `qwen2.5:7b-instruct` | 4-tool | dependencies | 10/10 | 10/10 | 10/10 | 6.0 | 5.9 |
+| `qwen2.5:7b-instruct` | 5-tool | dependencies | 10/10 | 10/10 | 10/10 | 6.3 | 6.1 |
+| `qwen2.5:7b-instruct` | 4-tool | search-term | 10/10 | 10/10 | 10/10 | 6.8 | 6.7 |
+| `qwen2.5:7b-instruct` | 5-tool | search-term | 10/10 | 10/10 | 10/10 | 7.0 | 6.8 |
+| `qwen2.5:7b-instruct` | 5-tool | report-finding | 10/10 | 10/10 | 10/10 | 19.3 | 19.2 |
+
+## M2 final accuracy summary (round 4, last tuning round) — 2026-10-01
+
+Final configuration: `qwen2.5:7b-instruct` on Ollama 0.10.1 (4096-token context), all M2b features
+on: candidate searches (the loop itself searches for password/secret/token/key/SELECT/execute( and
+puts the matching lines in the first message), corrective nudges, findings parsed from text, forced
+JSON reporting step, `confidence`/`suggestion` optional, and the round-3 fix so shortening the
+conversation for the final steps no longer clears seen lines.
+
+| Fixture | Planted | Verified planted | Verified false positives | Flagged (unverified) | Steps | Duration |
+|---|---|---|---|---|---|---|
+| `py-notes-api` | 4 | 3 | 0 | 1 (`SECRET_KEY = "change-me"` decoy) | 6 | 267s |
+| `js-shop` | 4 | 2 | 0 | 0 | 4 | 310s |
+| `clean-control` | 0 | 0 | **1** | 1 (`SESSION_SECRET` placeholder decoy) | 5 | 358s |
+
+Where each verified finding came from:
+
+| Fixture | Real `report_finding` call | Parsed from text | Forced JSON step |
+|---|---|---|---|
+| `py-notes-api` | — | — | SMTP password (`config.py:17`), f-string SQLi (`db.py:24`), `+` SQLi (`db.py:42`) |
+| `js-shop` | — | — | template-literal SQLi (`orders.js:16`), `PAYMENT_TOKEN` (`payments.js:7`) |
+| `clean-control` | — | false positive: `sql_injection` `inventory/db.py:14-30` | (same finding, deduplicated) |
+
+(clean-control's first attempt this round ended with an Ollama request timeout, an environment
+failure rather than an agent result; the table uses a clean re-run.)
+
+**Final numbers:**
+- **Recall: 5 of 8 planted bugs (62.5%)** verified. Missed: `notes-analytics-key`,
+  `shop-status-concat`, `shop-webhook-secret`. Across rounds: 0/8, 0/8, 4/8, 5/8.
+- **False positives: 1 of 6 verified findings (17%)**, 0 in the two fixtures with real bugs. The one
+  false positive is the known limitation recorded above. The model cited a 17-line range (`14-30`)
+  covering three parameterized queries *and* a logging f-string on line 18. The evidence check only
+  requires an SQL keyword and a string-building marker somewhere in the same window, so the log line
+  made it pass. Wide citations make this gap much easier to hit.
+- **Flagged, not verified:** 2 placeholder-secret decoys, correctly flagged by the evidence check and
+  kept out of the verified list.
+
+**No verified finding in any round came from a real `report_finding` tool call.** Every one came from
+the forced JSON step (5) or from text the loop parsed (round 3: 3). The only real tool calls ever made
+(clean-control, rounds 1 and 3) were false positives, and they were rejected or flagged.
+
+**Best guess why:** the model *can* make the call. The 5-tool smoke test above shows `report_finding`
+called 10/10 with arguments that all pass the real validator, when the prompt is short and literally
+says "record this as a finding". In a real scan none of that holds:
+1. **Reporting competes with finishing.** The model tends to save findings for its final answer, and
+   the system prompt asks for the final answer as plain text, so it writes findings as prose or JSON in
+   that text instead of making a separate call.
+2. **Once it starts writing text, it doesn't switch to a tool call.** With Qwen's chat template, Ollama
+   only produces a tool call if the reply *starts* as one. Rounds 2-3 showed the model writing ```` ```json ````
+   blocks or `report_finding(...)` text mid-answer, which Ollama returns as plain content.
+3. **The context is longer and fuller.** A ~2-3k-token conversation with 5 schemas, versus a
+   ~300-token single-turn test. `report_finding` is also the largest schema (9 fields), and it's
+   slower even in isolation (~19s vs ~7s per call).
+
+**What this means:** for this model, schema-constrained output (the forced JSON step) is the
+dependable path for structured findings, and tool calling is dependable for navigation. That split is
+the main design lesson of M2, worth stating plainly in the README's "honest limitations" section.
+Accuracy tuning for M2 stops here, as agreed. Further work belongs to M5's evaluation suite.
